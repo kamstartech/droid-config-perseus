@@ -1,8 +1,8 @@
 # These and other macros are documented in ../droid-configs-device/droid-configs.inc
 # Feel free to cleanup this file by removing comments, once you have memorised them ;)
 
-%define device xiaomi
-%define vendor perseus
+%define device perseus
+%define vendor xiaomi
 
 %define vendor_pretty Xiaomi
 %define device_pretty Mix 3
@@ -13,7 +13,8 @@
 # Pixel ratio 1.0 was originally jolla phone with 245ppi, and the devices
 # should roughly have their ppi compared to that. Large displays can use
 # bigger ratio if seen fit. Values are with 0.25 increments.
-%define pixel_ratio 1.0
+# Mi Mix 3: 403 PPI / 245 PPI ≈ 1.64 → nearest 0.25 increment = 1.5
+%define pixel_ratio 1.5
 
 %include droid-configs-device/droid-configs.inc
 %include patterns/patterns-sailfish-device-adaptation-perseus.inc
