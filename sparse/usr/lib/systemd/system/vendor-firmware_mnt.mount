@@ -1,0 +1,15 @@
+[Unit]
+Description=Droid mount for /vendor/firmware_mnt
+After=vendor.mount
+Requires=vendor.mount
+Before=local-fs.target
+
+[Mount]
+What=/dev/sde46
+Where=/vendor/firmware_mnt
+Type=vfat
+Options=ro,shortname=lower,uid=1000,gid=1000,dmask=227,fmask=337,context=u:object_r:firmware_file:s0
+TimeoutSec=5
+
+[Install]
+WantedBy=local-fs.target

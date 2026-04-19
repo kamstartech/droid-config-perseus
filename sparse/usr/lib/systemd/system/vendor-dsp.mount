@@ -1,0 +1,15 @@
+[Unit]
+Description=Droid mount for /vendor/dsp
+After=vendor.mount
+Requires=vendor.mount
+Before=local-fs.target
+
+[Mount]
+What=/dev/sde44
+Where=/vendor/dsp
+Type=ext4
+Options=ro,nosuid,nodev,barrier=1
+TimeoutSec=5
+
+[Install]
+WantedBy=local-fs.target

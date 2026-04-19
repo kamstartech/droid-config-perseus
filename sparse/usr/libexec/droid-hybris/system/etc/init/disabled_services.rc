@@ -42,5 +42,8 @@ service mediametrics /system/bin/mediametrics_HYBRIS_DISABLED
 
 service bpfloader /system/bin/netbpfload_HYBRIS_DISABLED
 
-# Perseus (Mesa KMS): hwcomposer not used — disable to avoid DRM conflicts
+# hwcomposer-2-3 HIDL service must stay disabled: libhybris uses passthrough
+# (loads hwcomposer.qcom.so directly via hw_get_module). If the HIDL service
+# also runs, both it and lipstick's passthrough instance try drmSetMaster(card0)
+# simultaneously — one fails and the display stays blank.
 service vendor.hwcomposer-2-3 /vendor/bin/hw/android.hardware.graphics.composer@2.3-service_HYBRIS_DISABLED

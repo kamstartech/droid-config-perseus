@@ -1,0 +1,13 @@
+[Unit]
+Description=Droid mount for /mnt/vendor/persist
+Before=local-fs.target
+
+[Mount]
+What=/dev/sda15
+Where=/mnt/vendor/persist
+Type=ext4
+Options=nosuid,nodev,barrier=1
+TimeoutSec=5
+
+[Install]
+WantedBy=local-fs.target
