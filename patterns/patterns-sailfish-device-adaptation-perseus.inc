@@ -14,12 +14,17 @@ Requires: droid-config-perseus-flashing
 Requires: droid-config-perseus-bluez5
 Requires: droid-hal-version-perseus
 
-# Hybris packages
-Requires: libhybris-libEGL
-Requires: libhybris-libGLESv2
-Requires: libhybris-libwayland-egl
+# Graphics: Mesa (KMS/DRM) instead of libhybris hwcomposer.
+# DRM/KMS confirmed working (display + touch functional). Switching to freedreno GPU.
+Requires: mesa-freedreno-libEGL
+Requires: mesa-freedreno-libGLESv2
+Requires: mesa-freedreno-libgbm
+Requires: mesa-freedreno-libglapi
+Requires: mesa-freedreno-dri-freedreno-driver
+# Optional: Vulkan support via Turnip
+# Requires: mesa-freedreno-vulkan-drivers
 
-# Sensors
+# Sensors (still need libhybris core, just not the EGL/GLES parts)
 Requires: hybris-libsensorfw-qt5
 
 # Vibra
@@ -40,17 +45,17 @@ Requires: pulseaudio-modules-droid-hidl
 # for audio recording to work:
 Requires: qt5-qtmultimedia-plugin-mediaservice-gstmediacapture
 
-# These need to be per-device due to differing backends (fbdev, eglfs, hwc, ..?)
+# Qt platform plugin for Mesa KMS/DRM output
 Requires: qt5-qtwayland-wayland_egl
-Requires: qt5-qpa-hwcomposer-plugin
+Requires: qt5-plugin-platform-eglfs
 Requires: qtscenegraph-adaptation
 
 # For hybris devices with droidmedia, see HADK pdf for more information
 Requires: gstreamer1.0-droid
 Requires: gmp-droid
 
-# This is needed for notification LEDs
-Requires: mce-plugin-libhybris
+# MCE uses built-in DRM DPMS support with Mesa (no libhybris plugin needed)
+# Requires: mce-plugin-libhybris
 
 # USB mode controller
 Requires: usb-moded
