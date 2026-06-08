@@ -21,8 +21,7 @@ Requires: mesa-freedreno-libGLESv2
 Requires: mesa-freedreno-libgbm
 Requires: mesa-freedreno-libglapi
 Requires: mesa-freedreno-dri-freedreno-driver
-# Optional: Vulkan support via Turnip
-# Requires: mesa-freedreno-vulkan-drivers
+Requires: mesa-freedreno-vulkan-drivers
 
 # Sensors (still need libhybris core, just not the EGL/GLES parts)
 Requires: hybris-libsensorfw-qt5
