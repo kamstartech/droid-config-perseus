@@ -1,0 +1,16 @@
+[Unit]
+Description=Droid mount for /config
+DefaultDependencies=no
+After=sys-kernel-config.mount
+Requires=sys-kernel-config.mount
+Before=local-fs.target systemd-modules-load.service
+
+[Mount]
+What=/sys/kernel/config
+Where=/config
+Type=none
+Options=bind
+TimeoutSec=10
+
+[Install]
+WantedBy=local-fs.target

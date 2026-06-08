@@ -1,0 +1,14 @@
+[Unit]
+Description=Kernel Configuration File System
+DefaultDependencies=no
+Before=local-fs.target systemd-modules-load.service
+
+[Mount]
+What=none
+Where=/sys/kernel/config
+Type=configfs
+Options=nodev,noexec,nosuid
+TimeoutSec=10
+
+[Install]
+WantedBy=local-fs.target
