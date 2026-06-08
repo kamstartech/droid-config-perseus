@@ -364,11 +364,12 @@ for dri in msm_drm swrast kms_swrast; do
     [ -e "$target" ] || ln -sf /usr/lib64/dri/msm_dri.so "$target"
 done
 log "Mesa DRI symlinks: $(ls /usr/lib64/dri/*_dri.so 2>/dev/null | wc -l) drivers"
-# Mesa's __normal_user() blocks MESA_LOADER_DRIVER_OVERRIDE (and all Mesa env
-# overrides) for setgid binaries. lipstick ships with setgid=privileged(996)
-# for MDM, but /dev/kgsl-3d0 and /dev/dri/card0 are world-accessible so the
-# nemo user doesn't need it for GPU rendering. Remove setgid so Zink can load.
-chmod g-s /usr/bin/lipstick 2>/dev/null && log "lipstick: removed setgid (enables MESA_LOADER_DRIVER_OVERRIDE)"
+# lipstick setgid removal is handled by systemd ExecStartPre=+/bin/chmod g-s
+# in lipstick.service.d/99-mesa-kms.conf. That drop-in runs as root inside the
+# SailfishOS namespace, which is reliable. This is a belt-and-suspenders fallback
+# that also logs the result unconditionally for diagnosis.
+CHMOD_OUT=$(chmod g-s /usr/bin/lipstick 2>&1); CHMOD_RC=$?
+log "lipstick setgid: chmod exit=$CHMOD_RC${CHMOD_OUT:+ err: $CHMOD_OUT} perms=$(ls -la /usr/bin/lipstick 2>/dev/null | cut -c1-10 || echo 'not found')"
 log "Starting droid-hal-init (Mesa KMS mode — no HWC2 required)..."
 /sbin/droid-hal-init >> $LOGF 2>&1 &
 INIT_PID=$!
