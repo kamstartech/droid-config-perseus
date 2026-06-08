@@ -1,7 +1,8 @@
 [Unit]
 Description=droid-hal-init
 Wants=systemd-udev-settle.service
-After=local-fs.target systemd-udev-settle.service systemd-tmpfiles-setup.service
+After=local-fs.target systemd-udev-settle.service systemd-tmpfiles-setup.service droid-hal-prepare.service
+Requires=droid-hal-prepare.service
 Before=basic.target network.target bluetooth.service ofono.service sensorfwd.service
 DefaultDependencies=no
 Conflicts=shutdown.target
@@ -12,10 +13,9 @@ Conflicts=shutdown.target
 [Service]
 Type=notify
 NotifyAccess=all
-# Sandboxing removed: droid-hal-early-init mounts Android partitions that must
-# be visible to droid-hal-startup. ProtectSystem=full creates a private mount
-# namespace where ExecStartPre mounts do not propagate to ExecStart.
-ExecStartPre=-/bin/sh /usr/bin/droid/droid-hal-early-init.sh
+# Intentionally un-sandboxed: droid-hal-startup.sh mounts tmpfs on /data and /apex,
+# bind-mounts stubs over Android graphics services, and needs full access to the
+# Android partition layout prepared by droid-hal-prepare.service.
 ExecStart=/bin/sh /usr/bin/droid/droid-hal-startup.sh
 ExecStop=/bin/sh /usr/bin/droid/droid-hal-shutdown.sh
 Restart=always

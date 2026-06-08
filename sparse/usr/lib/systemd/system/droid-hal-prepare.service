@@ -1,0 +1,17 @@
+[Unit]
+Description=Prepare Android partitions and runtime for droid-hal-init
+DefaultDependencies=no
+After=droid-mount-setup.service local-fs.target systemd-udev-settle.service systemd-tmpfiles-setup.service
+Requires=droid-mount-setup.service
+Before=droid-hal-init.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Intentionally un-sandboxed: this service mounts Android partitions,
+# populates APEX runtime, and creates linkerconfig that must be visible
+# in the host mount namespace for droid-hal-startup.sh to use.
+ExecStart=/bin/sh /usr/bin/droid/droid-hal-early-init.sh
+
+[Install]
+WantedBy=basic.target
