@@ -373,6 +373,56 @@ log "Mesa DRI symlinks: $(ls /usr/lib64/dri/*_dri.so 2>/dev/null | wc -l) driver
 # that also logs the result unconditionally for diagnosis.
 CHMOD_OUT=$(chmod g-s /usr/bin/lipstick 2>&1); CHMOD_RC=$?
 log "lipstick setgid: chmod exit=$CHMOD_RC${CHMOD_OUT:+ err: $CHMOD_OUT} perms=$(ls -la /usr/bin/lipstick 2>/dev/null | cut -c1-10 || echo 'not found')"
+# Ensure qcrild runtime environment exists before droid-hal-init triggers it.
+# init.qcom.rc's post-fs-data block creates these, but in the hybris namespace
+# it may run too late (or not at all), causing qcrild to exit status 1.
+ensure_qcrild_env() {
+    mkdir -p /data/vendor/radio /data/vendor/netmgr /data/vendor/port_bridge \
+             /data/vendor/connectivity /data/vendor/modem_config \
+             /dev/socket/qmux_radio
+    chown system:radio /data/vendor/radio
+    chmod 0770 /data/vendor/radio
+    chown radio:radio /data/vendor/netmgr /data/vendor/port_bridge /data/vendor/connectivity
+    chmod 0770 /data/vendor/netmgr /data/vendor/port_bridge
+    chmod 0771 /data/vendor/connectivity
+    chown radio:root /data/vendor/modem_config
+    chmod 0570 /data/vendor/modem_config
+    chown radio:radio /dev/socket/qmux_radio
+    chmod 0770 /dev/socket/qmux_radio
+    if [ -f /vendor/radio/qcril_database/qcril.db ]; then
+        cp -f /vendor/radio/qcril_database/qcril.db /data/vendor/radio/qcril_prebuilt.db
+        chown radio:radio /data/vendor/radio/qcril_prebuilt.db
+        chmod 0660 /data/vendor/radio/qcril_prebuilt.db
+    fi
+    printf '%s' '0' > /data/vendor/radio/copy_complete
+    chown radio:radio /data/vendor/radio/copy_complete
+    chmod 0660 /data/vendor/radio/copy_complete
+    printf '%s' '1' > /data/vendor/radio/prebuilt_db_support
+    chown radio:radio /data/vendor/radio/prebuilt_db_support
+    chmod 0400 /data/vendor/radio/prebuilt_db_support
+    printf '%s' '0' > /data/vendor/radio/db_check_done
+    chown radio:radio /data/vendor/radio/db_check_done
+    chmod 0660 /data/vendor/radio/db_check_done
+    log "qcrild env: /data/vendor/radio prepared"
+}
+
+# Wrap qcrild to capture its stderr. droid-hal-init swallows service stderr by
+# default, so we bind-mount a wrapper that logs to /data/vendor/radio/qcrild.log.
+install_qcrild_wrapper() {
+    local real=/vendor/bin/hw/qcrild
+    local wrap=/tmp/qcrild-wrapper
+    local bak=/tmp/qcrild.real
+    [ -x "$real" ] || return 0
+    cp -af "$real" "$bak" 2>/dev/null || return 0
+    cat > "$wrap" <<WRAP
+#!/system/bin/sh
+exec $bak "\$@" > /data/vendor/radio/qcrild.log 2>&1
+WRAP
+    chmod 755 "$wrap"
+    mount --bind "$wrap" "$real" 2>/dev/null && log "Wrapped $real -> $wrap"
+}
+
+ensure_qcrild_env
 log "Starting droid-hal-init (Mesa KMS mode — no HWC2 required)..."
 /sbin/droid-hal-init >> $LOGF 2>&1 &
 INIT_PID=$!
@@ -387,6 +437,11 @@ for i in $(seq 1 10); do
     fi
     sleep 1
 done
+
+# Give droid-hal-init's post-fs-data action time to run before we start qcrild.
+# Starting it too early causes exit status 1 because /data/vendor/radio is not ready.
+sleep 2
+install_qcrild_wrapper
 
 # Explicitly start HAL services that were disabled by class_start main removal.
 # Audio, vibrator and radio are in class main/late_start, so they don't auto-start.
