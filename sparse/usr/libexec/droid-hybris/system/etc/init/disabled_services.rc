@@ -1,49 +1,55 @@
-service netd netd_HYBRIS_DISABLED
+service surfaceflinger /system/bin/surfaceflinger_HYBRIS_DISABLED
+    override
+    disabled
 
-service installd installd_HYBRIS_DISABLED
+service cameraserver /system/bin/cameraserver_HYBRIS_DISABLED
+    override
+    disabled
 
-service cameraserver cameraserver_HYBRIS_DISABLED
+service audioserver /system/bin/audioserver_HYBRIS_DISABLED
+    override
+    disabled
 
-service audioserver audioserver_HYBRIS_DISABLED
+service logd /system/bin/logd_HYBRIS_DISABLED
+    override
+    disabled
 
-service update_engine update_engine_HYBRIS_DISABLED
+service netd /system/bin/netd_HYBRIS_DISABLED
+    override
+    disabled
 
-service vendor.audio-hal /vendor/bin/hw/android.hardware.audio.service_HYBRIS_DISABLED
+service installd /system/bin/installd_HYBRIS_DISABLED
+    override
+    disabled
+
+service update_engine /system/bin/update_engine_HYBRIS_DISABLED
+    override
+    disabled
 
 service lmkd /system/bin/lmkd_HYBRIS_DISABLED
-
-service vold /system/bin/vold_HYBRIS_DISABLED
-
-service wificond /system/bin/wificond_HYBRIS_DISABLED
+    override
+    disabled
 
 service storaged /system/bin/storaged_HYBRIS_DISABLED
-
-service surfaceflinger surfaceflinger_HYBRIS_DISABLED
+    override
+    disabled
 
 service bootanim /system/bin/bootanimation_HYBRIS_DISABLED
-
-service vendor.usb-hal-1-3 /vendor/bin/hw/android.hardware.usb@1.3-service_HYBRIS_DISABLED
-
-service vendor.vibrator-1-0 /vendor/bin/hw/android.hardware.vibrator@1.0-service_HYBRIS_DISABLED
-
-service update_verifier_nonencrypted /system/bin/update_verifier_HYBRIS_DISABLED nonencrypted
-
-service update_verifier /system/bin/update_verifier_HYBRIS_DISABLED ${vold.decrypt}
+    override
+    disabled
 
 service gpu /system/bin/gpuservice_HYBRIS_DISABLED
-
-service time_daemon /vendor/bin/time_daemon_HYBRIS_DISABLED
     override
+    disabled
 
 service mediaextractor /system/bin/mediaextractor_HYBRIS_DISABLED
     override
+    disabled
 
 service mediametrics /system/bin/mediametrics_HYBRIS_DISABLED
+    override
+    disabled
 
 service bpfloader /system/bin/netbpfload_HYBRIS_DISABLED
-
-# hwcomposer-2-3 HIDL service must stay disabled: libhybris uses passthrough
-# (loads hwcomposer.qcom.so directly via hw_get_module). If the HIDL service
-# also runs, both it and lipstick's passthrough instance try drmSetMaster(card0)
-# simultaneously — one fails and the display stays blank.
-service vendor.hwcomposer-2-3 /vendor/bin/hw/android.hardware.graphics.composer@2.3-service_HYBRIS_DISABLED
+    override
+    disabled

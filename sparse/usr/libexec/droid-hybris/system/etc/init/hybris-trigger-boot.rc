@@ -1,0 +1,3 @@
+on init
+    trigger early-boot
+    trigger boot

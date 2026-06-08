@@ -1,9 +1,12 @@
 [Unit]
 Description=Droid mount for /vendor
+DefaultDependencies=no
+After=droid-mount-setup.service
+Requires=droid-mount-setup.service
 Before=vendor-bt_firmware.mount vendor-dsp.mount vendor-firmware_mnt.mount local-fs.target systemd-modules-load.service
 
 [Mount]
-What=/dev/mapper/vendor
+What=/run/droid/vendor
 Where=/vendor
 Type=ext4
 Options=ro

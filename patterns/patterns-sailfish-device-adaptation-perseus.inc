@@ -36,6 +36,9 @@ Requires: qt5-plugin-generic-evdev
 Requires: pulseaudio-modules-droid
 Requires: pulseaudio-modules-droid-hidl
 
+# Cellular/RIL: ofono binder plugin talks to qcrild via libgbinder
+Requires: ofono-ril-binder-plugin
+
 # The -dummy-af is needed for newer devices that run the main
 # audiosystem-passthrough in qti mode (e.g. >=Android 9 Qualcomm),
 # to fix non-responding Camera app and/or voice during a phone call:

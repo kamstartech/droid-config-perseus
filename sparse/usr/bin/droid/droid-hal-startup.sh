@@ -416,23 +416,35 @@ ensure_qcrild_env() {
     printf '%s' '0' > /data/vendor/radio/db_check_done
     chown radio:radio /data/vendor/radio/db_check_done
     chmod 0660 /data/vendor/radio/db_check_done
-    log "qcrild env: /data/vendor/radio prepared"
+
+    # Keep qcrild stderr on the persist partition; tmpfs /data is lost on reboot.
+    mkdir -p /mnt/vendor/persist/radio
+    chown radio:radio /mnt/vendor/persist/radio
+    chmod 0770 /mnt/vendor/persist/radio
+    touch /mnt/vendor/persist/radio/qcrild.log
+    chown radio:radio /mnt/vendor/persist/radio/qcrild.log
+    chmod 0660 /mnt/vendor/persist/radio/qcrild.log
+
+    log "qcrild env: /data/vendor/radio and /mnt/vendor/persist/radio prepared"
 }
 
 # Wrap qcrild to capture its stderr. droid-hal-init swallows service stderr by
-# default, so we bind-mount a wrapper that logs to /data/vendor/radio/qcrild.log.
+# default, so we bind-mount a wrapper that logs to the persist partition.
 install_qcrild_wrapper() {
     local real=/vendor/bin/hw/qcrild
     local wrap=/tmp/qcrild-wrapper
     local bak=/tmp/qcrild.real
+    local logf=/mnt/vendor/persist/radio/qcrild.log
     [ -x "$real" ] || return 0
     cp -af "$real" "$bak" 2>/dev/null || return 0
     cat > "$wrap" <<WRAP
 #!/system/bin/sh
-exec $bak "\$@" > /data/vendor/radio/qcrild.log 2>&1
+# Preserve one prior invocation on the persist partition.
+[ -f $logf ] && cp -f $logf ${logf}.prev 2>/dev/null
+exec $bak "\$@" > $logf 2>&1
 WRAP
     chmod 755 "$wrap"
-    mount --bind "$wrap" "$real" 2>/dev/null && log "Wrapped $real -> $wrap"
+    mount --bind "$wrap" "$real" 2>/dev/null && log "Wrapped $real -> $wrap (log: $logf)"
 }
 
 ensure_qcrild_env
