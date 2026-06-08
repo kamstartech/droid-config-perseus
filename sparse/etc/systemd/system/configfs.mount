@@ -1,0 +1,14 @@
+[Unit]
+Description=Configuration File System
+DefaultDependencies=no
+ConditionPathExists=/sys/kernel/config
+Before=sysinit.target local-fs.target
+
+[Mount]
+What=configfs
+Where=/config
+Type=configfs
+Options=nosuid,nodev,noexec
+
+[Install]
+WantedBy=local-fs.target
