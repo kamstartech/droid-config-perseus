@@ -78,6 +78,9 @@ refresh_nodes() {
         [ -b "/dev/block/dm-$dm_num" ] || mknod "/dev/block/dm-$dm_num" b "$major" "$minor" 2>/dev/null
         ln -sf "../../block/dm-$dm_num" "/dev/mapper/$n" 2>/dev/null || true
         ln -sf "/dev/mapper/$n" "/run/droid/$n" 2>/dev/null || true
+        # Re-emit uevent so systemd-udevd (which started after Android init created
+        # these dm devices) notices them and populates dev-dm-X.device units.
+        printf add > "/sys/block/dm-$dm_num/uevent" 2>/dev/null && log "uevent add dm-$dm_num ($n)"
     done
 }
 
