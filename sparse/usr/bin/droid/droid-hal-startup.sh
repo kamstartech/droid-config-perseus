@@ -312,6 +312,9 @@ mount_stub() {
 mount_stub /system/bin/surfaceflinger
 mount_stub /system/bin/bootanimation
 mount_stub /system/bin/vdc
+# HWC takes DRM master from /dev/dri/card0, blocking Mesa KMS.
+# Stub it so droid-hal-init's launch of vendor.hwcomposer-2-3 exits immediately.
+mount_stub /vendor/bin/hw/android.hardware.graphics.composer@2.3-service
 
 # Populate /apex tmpfs for Android 15 APEX bionic.
 # /system is already mounted by the .mount units before this service runs.
@@ -386,8 +389,8 @@ for i in $(seq 1 10); do
 done
 
 # Explicitly start HAL services that were disabled by class_start main removal.
-# Audio and vibrator are in class main/late_start, so they don't auto-start.
-for svc in vendor.audio-hal vendor.qti.vibrator; do
+# Audio, vibrator and radio are in class main/late_start, so they don't auto-start.
+for svc in vendor.audio-hal vendor.qti.vibrator vendor.qcrild; do
     if [ -x /system/bin/setprop ]; then
         /system/bin/setprop ctl.start "$svc" 2>/dev/null && log "Started $svc via setprop"
     elif [ -x /vendor/bin/setprop ]; then
