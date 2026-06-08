@@ -182,18 +182,21 @@ patch_rc_audio_hal /vendor/etc/init/android.hardware.audio.service.rc
 
 # USB HAL service: disable it so usb-moded has exclusive gadget control.
 # Android's usb-hal fights with usb-moded for /config/usb_gadget/g1.
+# Perseus uses android.hardware.usb@1.3-service.dual_role_usb.rc, not init.qcom.usb.rc.
 patch_rc_usb_hal() {
     local orig="$1"
     [ -f "$orig" ] || return 0
     local tmp
     tmp=$(mktemp -t hybris-rc.XXXXXX) || return 1
-    sed -e '/start vendor.usb-hal-/d' \
-        -e '/^service vendor.usb-hal- /a\    override\n    disabled' \
+    sed -e '/start vendor.usb-hal/d' \
+        -e '/^service vendor.usb-hal-/a\    override\n    disabled' \
         "$orig" > "$tmp"
     mount --bind "$tmp" "$orig" && log "Patched $(basename $orig): disabled USB HAL" \
         || log "WARN: failed to bind-mount USB HAL patch for $orig"
 }
+# Try both the old qcom RC path and the actual dual-role USB HAL RC on sdm845/perseus.
 patch_rc_usb_hal /vendor/etc/init/hw/init.qcom.usb.rc
+patch_rc_usb_hal /vendor/etc/init/android.hardware.usb@1.3-service.dual_role_usb.rc
 
 # HADK FAQ 13.9: Devices with qseecomd usually have issues getting to UI.
 # Disable it to prevent the restart loop from spamming logs and CPU.
