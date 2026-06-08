@@ -370,6 +370,16 @@ for dri in msm_drm swrast kms_swrast; do
     [ -e "$target" ] || ln -sf /usr/lib64/dri/msm_dri.so "$target"
 done
 log "Mesa DRI symlinks: $(ls /usr/lib64/dri/*_dri.so 2>/dev/null | wc -l) drivers"
+
+# KGSL loads a630_sqe.fw + a630_gmu.bin via request_firmware() when the GPU
+# powers on. systemd-udev searches /lib/firmware/ — symlink from /vendor/firmware/.
+mkdir -p /lib/firmware
+for fw in a630_sqe.fw a630_gmu.bin a630_zap.mdt a630_zap.b00 a630_zap.b01 a630_zap.b02 a630_zap.elf; do
+    src="/vendor/firmware/$fw"
+    [ -f "$src" ] && ln -sf "$src" "/lib/firmware/$fw" 2>/dev/null
+done
+log "GPU firmware: $(ls /lib/firmware/a630* 2>/dev/null | wc -l) a630 files linked"
+
 # lipstick setgid removal is handled by systemd ExecStartPre=+/bin/chmod g-s
 # in lipstick.service.d/99-mesa-kms.conf. That drop-in runs as root inside the
 # SailfishOS namespace, which is reliable. This is a belt-and-suspenders fallback
