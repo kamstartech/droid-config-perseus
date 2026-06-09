@@ -33,13 +33,17 @@ adb shell "rm -rf /data/.stowaway/sailfish/*"
 # 4. Extract new rootfs
 adb shell "tar -xjf /data/local/tmp/sfe-perseus-5.0.0.76.tar.bz2 -C /data/.stowaway/sailfish/"
 
-# 5. Verify key files
+# 5. Enable persistent journald logs (HADK: Logs across reboots)
+adb shell "sed -i 's/^Storage=volatile/Storage=automatic/' /data/.stowaway/sailfish/etc/systemd/journald.conf"
+adb shell "mkdir -p /data/.stowaway/sailfish/var/log/journal"
+
+# 6. Verify key files
 adb shell "ls /data/.stowaway/sailfish/sbin/init /data/.stowaway/sailfish/usr/lib64/dri/msm_dri.so"
 
-# 6. Clean up temp archive
+# 7. Clean up temp archive
 adb shell "rm -f /data/local/tmp/sfe-perseus-5.0.0.76.tar.bz2"
 
-# 7. Trigger SailfishOS boot
+# 8. Trigger SailfishOS boot
 adb shell "reboot hybridos,sailfish"
 ```
 
