@@ -448,6 +448,9 @@ install_qcrild_wrapper() {
 #!/system/bin/sh
 # Preserve one prior invocation on the persist partition.
 [ -f $logf ] && cp -f $logf ${logf}.prev 2>/dev/null
+# The real binary is at /tmp/qcrild.real which falls into the default linker
+# namespace (not vendor). Ensure APEX libs are discoverable.
+export LD_LIBRARY_PATH=/apex/com.android.i18n/lib64:/apex/com.android.conscrypt/lib64:/apex/com.android.runtime/lib64:/vendor/lib64:/system/lib64:\${LD_LIBRARY_PATH}
 exec $bak "\$@" > $logf 2>&1
 WRAP
     chmod 755 "$wrap"
