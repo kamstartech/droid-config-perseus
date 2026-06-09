@@ -209,14 +209,14 @@ dir.vendor = /vendor/bin
 [system]
 additional.namespaces = default
 namespace.default.isolated = false
-namespace.default.search.paths = /system/lib64/bootstrap:/system/lib64:/system/lib64/hw:/system_ext/lib64:/product/lib64:/odm/lib64:/apex/com.android.runtime/lib64
+namespace.default.search.paths = /system/lib64/bootstrap:/system/lib64:/system/lib64/hw:/system_ext/lib64:/product/lib64:/odm/lib64:/apex/com.android.runtime/lib64:/apex/com.android.i18n/lib64:/apex/com.android.conscrypt/lib64
 namespace.default.permitted.paths = /system:/vendor:/system_ext:/product:/odm:/apex:/data
 namespace.default.asan.search.paths = /system/lib64
 
 [vendor]
 additional.namespaces = default
 namespace.default.isolated = false
-namespace.default.search.paths = /vendor/lib64:/vendor/lib64/hw:/system/lib64/bootstrap:/system/lib64:/system/lib64/hw:/system_ext/lib64:/product/lib64:/odm/lib64:/apex/com.android.runtime/lib64
+namespace.default.search.paths = /vendor/lib64:/vendor/lib64/hw:/system/lib64/bootstrap:/system/lib64:/system/lib64/hw:/system_ext/lib64:/product/lib64:/odm/lib64:/apex/com.android.runtime/lib64:/apex/com.android.i18n/lib64:/apex/com.android.conscrypt/lib64
 namespace.default.permitted.paths = /system:/vendor:/system_ext:/product:/odm:/apex:/data
 namespace.default.asan.search.paths = /vendor/lib64
 LDCFG
