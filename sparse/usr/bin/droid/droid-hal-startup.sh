@@ -16,13 +16,6 @@ chmod 0755 /dev/socket
 chown root:root /dev/socket
 log "Created /dev/socket"
 
-# usb-moded detects configfs at /sys/kernel/config, but droid-hal's config.mount
-# mounts it at /config. Make the standard path available before usb-moded starts.
-if mountpoint -q /config 2>/dev/null && ! mountpoint -q /sys/kernel/config 2>/dev/null; then
-    mkdir -p /sys/kernel/config
-    mount --bind /config /sys/kernel/config 2>/dev/null && log "Bind-mounted /config -> /sys/kernel/config"
-fi
-
 create_node() {
     local path="$1"
     local type="$2"
