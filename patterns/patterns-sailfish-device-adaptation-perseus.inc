@@ -37,7 +37,8 @@ Requires: pulseaudio-modules-droid
 Requires: pulseaudio-modules-droid-hidl
 
 # Cellular/RIL: ofono binder plugin talks to qcrild via libgbinder
-Requires: ofono-ril-binder-plugin
+# ofono-ril-binder-plugin <= android 10, ofono-binder-plugin >= android 10
+Requires: ofono-binder-plugin
 
 # The -dummy-af is needed for newer devices that run the main
 # audiosystem-passthrough in qti mode (e.g. >=Android 9 Qualcomm),
