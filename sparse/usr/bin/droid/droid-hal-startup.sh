@@ -3,6 +3,81 @@ LOGF=/var/log/droid-hal-debug.log
 KMSGF=/var/log/droid-hal-kmsg.log
 log() { echo "$(date '+%H:%M:%S') startup: $*" >> $LOGF; echo "droid-hal-startup: $*" > /dev/kmsg 2>/dev/null; }
 
+ensure_permissive() {
+    local tag="${1:-unknown}"
+    local i=0
+    local max=5
+    local sys_state ge_state
+
+    while [ "$i" -lt "$max" ]; do
+        sys_state=$(cat /sys/fs/selinux/enforce 2>/dev/null || echo '?')
+        ge_state=$(/system/bin/getenforce 2>/dev/null || echo 'Unknown')
+
+        if [ "$sys_state" = "0" ] && { [ "$ge_state" = "Permissive" ] || [ "$ge_state" = "Unknown" ]; }; then
+            [ "$i" -gt 0 ] && log "ensure_permissive[$tag]: stable after $i attempt(s)"
+            return 0
+        fi
+
+        log "ensure_permissive[$tag]: sys=$sys_state getenforce=$ge_state -> forcing permissive (attempt $((i+1))/$max)"
+        echo 0 > /sys/fs/selinux/enforce 2>/dev/null || log "WARN: ensure_permissive[$tag]: cannot write /sys/fs/selinux/enforce"
+        i=$((i + 1))
+        sleep 0.2
+    done
+
+    log "WARN: ensure_permissive[$tag]: could not stabilize permissive after $max attempts"
+    return 1
+}
+
+scan_selinux_setters() {
+    log "SELinux setter scan:"
+    grep -RsnE 'setenforce|write[[:space:]]+/sys/fs/selinux/enforce' \
+        /system/etc/init /system/etc/init/hw /vendor/etc/init /vendor/etc/init/hw \
+        /usr/libexec/droid-hybris/system/etc/init /usr/libexec/droid-hybris/system/etc/init/hw \
+        2>/dev/null | while read -r line; do
+        log "  setter: $line"
+    done
+}
+
+snapshot_on_flip() {
+    local tag="$1"
+    log "SELinux flip-back detected at $tag"
+    log "  processes: $(pgrep -a 2>/dev/null | tr '\n' ';' || ps 2>/dev/null | tr '\n' ';')"
+    log "  dmesg tail: $(dmesg | tail -n 30 | tr '\n' '|')"
+    log "  startup log tail: $(tail -n 20 "$LOGF" | tr '\n' '|')"
+}
+
+poll_permissive() {
+    set +e
+    local duration=120
+    local interval=2
+    local elapsed=0
+    local last_sys last_ge
+
+    last_sys=$(cat /sys/fs/selinux/enforce 2>/dev/null || echo '?')
+    last_ge=$(/system/bin/getenforce 2>/dev/null || echo 'Unknown')
+
+    while [ "$elapsed" -lt "$duration" ]; do
+        sleep "$interval"
+        elapsed=$((elapsed + interval))
+
+        local sys_state ge_state
+        sys_state=$(cat /sys/fs/selinux/enforce 2>/dev/null || echo '?')
+        ge_state=$(/system/bin/getenforce 2>/dev/null || echo 'Unknown')
+
+        if [ "$sys_state" != "$last_sys" ] || [ "$ge_state" != "$last_ge" ]; then
+            log "poll_permissive: state changed sys=$last_sys->$sys_state getenforce=$last_ge->$ge_state"
+            if [ "$sys_state" = "1" ] || [ "$ge_state" = "Enforcing" ]; then
+                snapshot_on_flip "poll+$elapsed"
+                ensure_permissive "poll+$elapsed"
+            fi
+            last_sys="$sys_state"
+            last_ge="$ge_state"
+        fi
+    done
+
+    log "poll_permissive: watchdog exiting after ${duration}s"
+}
+
 log "startup.sh running"
 echo 0 > /proc/sys/kernel/printk_ratelimit 2>/dev/null
 echo 0 > /proc/sys/kernel/printk_ratelimit_burst 2>/dev/null
@@ -15,6 +90,12 @@ mkdir -p /dev/socket
 chmod 0755 /dev/socket
 chown root:root /dev/socket
 log "Created /dev/socket"
+
+# Fix /tmp permissions early. systemd tmp.mount leaves /tmp with the wrong
+# mode on this device (0771 shell shell), breaking contacts/app semaphores.
+chmod 1777 /tmp 2>/dev/null || true
+chown root:root /tmp 2>/dev/null || true
+log "Fixed /tmp permissions: $(stat -c '%a %U:%G' /tmp 2>/dev/null || echo 'unknown')"
 
 create_node() {
     local path="$1"
@@ -98,6 +179,29 @@ else
     log "selinuxfs already mounted"
 fi
 
+# TRD-010/TRD-016: un-gate the libselinux banking spoof for the hybris container.
+# external/selinux/libselinux security_getenforce() is hardcoded to report ENFORCING
+# (NetHunter banking/Play-Integrity stealth). servicemanager/hwservicemanager do their
+# { add } access check in USERSPACE via that function, so the spoof makes them DENY
+# vendor-HAL registration here even though the kernel is permissive → HAL SIGABRTs, no
+# IRadio, crash-loops. This marker tells the patched security_getenforce() to return the
+# REAL kernel state inside SFOS only. Android never creates it, so banking is unaffected.
+# Must exist before droid-hal-init starts servicemanager.
+touch /dev/.hybris_selinux_real 2>/dev/null \
+    && log "Created /dev/.hybris_selinux_real (libselinux reports real enforce state in SFOS)" \
+    || log "WARN: could not create /dev/.hybris_selinux_real (HAL registration may stay blocked)"
+
+# Label binder nodes with correct SELinux contexts. In Android these are set by
+# ueventd/binderfs; in hybris we create them manually so we must label them.
+# MUST run after selinuxfs is mounted (above) — chcon needs /sys/fs/selinux.
+/system/bin/chcon u:object_r:binder_device:s0 /dev/binder 2>/dev/null || log "WARN: chcon /dev/binder failed"
+/system/bin/chcon u:object_r:hwbinder_device:s0 /dev/hwbinder 2>/dev/null || log "WARN: chcon /dev/hwbinder failed"
+/system/bin/chcon u:object_r:vndbinder_device:s0 /dev/vndbinder 2>/dev/null || log "WARN: chcon /dev/vndbinder failed"
+
+# Checkpoint 1: baseline SELinux permissive before RC patching.
+ensure_permissive "post-selinuxfs-mount"
+scan_selinux_setters
+
 # Remove reboot_on_failure directives from Android init RC files.
 # We ensure the Sailfish root is RW as permitted, but /system remains read-only.
 mount -o remount,rw / 2>/dev/null
@@ -121,6 +225,8 @@ patch_rc_init_hybris() {
     sed -e '/reboot_on_failure/d' \
         -e '/[[:space:]]start logd$/d' \
         -e '/[[:space:]]start logd-reinit$/d' \
+        -e '/[[:space:]]start odsign$/d' \
+        -e '/[[:space:]]start derive_classpath$/d' \
         -e '/[[:space:]]exec_start bpfloader$/d' \
         -e '/exec.*vdc.*checkpoint/d' \
         -e '/exec.*vdc.*keymaster/d' \
@@ -166,7 +272,10 @@ patch_rc_display_hal /vendor/etc/init/vendor.display.color@1.0-service.rc
 patch_rc_display_hal /system/etc/init/surfaceflinger.rc
 patch_rc_display_hal /vendor/etc/init/android.hardware.sensors@1.0-service.rc
 
-# Audio HAL service: remove task_profiles and audioserver onrestart to prevent init issues
+# Audio HAL service: remove task_profiles and audioserver onrestart, and mark disabled.
+# vendor.audio-hal is in class hal — class_start hal fires it even though we remove
+# class_start main/late_start. Injecting 'disabled' prevents auto-start via any trigger.
+# pulseaudio-modules-droid uses libhardware directly and does NOT need this HIDL service.
 patch_rc_audio_hal() {
     local orig="$1"
     [ -f "$orig" ] || return 0
@@ -174,11 +283,23 @@ patch_rc_audio_hal() {
     tmp=$(mktemp -t hybris-rc.XXXXXX) || return 1
     sed -e '/task_profiles/d' \
         -e '/onrestart restart audioserver/d' \
+        -e '/^service vendor\.audio-hal /a\    override\n    disabled' \
         "$orig" > "$tmp"
-    mount --bind "$tmp" "$orig" && log "Patched audio HAL $(basename $orig): hybris fixes" \
+    mount --bind "$tmp" "$orig" && log "Patched audio HAL $(basename $orig): hybris fixes (disabled)" \
         || log "WARN: failed to bind-mount audio HAL patch for $orig"
 }
 patch_rc_audio_hal /vendor/etc/init/android.hardware.audio.service.rc
+
+# Patch audio policy config: add AUDIO_FORMAT_PCM_16_BIT profiles to primary output
+# and deep_buffer ports so pulseaudio module-droid-card finds a compatible format.
+# The vendor config only declares AUDIO_FORMAT_PCM_24_BIT_PACKED which is not in
+# pulseaudio-modules-droid's supported format list, causing droid-sink to fail to open.
+AUDIO_POLICY_PATCH=/usr/share/perseus-audio-policy/audio_policy_configuration.xml
+if [ -f "$AUDIO_POLICY_PATCH" ] && [ -f /vendor/etc/audio_policy_configuration.xml ]; then
+    mount --bind "$AUDIO_POLICY_PATCH" /vendor/etc/audio_policy_configuration.xml \
+        && log "Patched audio_policy_configuration.xml: added PCM_16_BIT to primary output and deep_buffer" \
+        || log "WARN: audio policy config patch failed"
+fi
 
 # USB HAL service: disable it so usb-moded has exclusive gadget control.
 # Android's usb-hal fights with usb-moded for /config/usb_gadget/g1.
@@ -198,9 +319,32 @@ patch_rc_usb_hal() {
 patch_rc_usb_hal /vendor/etc/init/hw/init.qcom.usb.rc
 patch_rc_usb_hal /vendor/etc/init/android.hardware.usb@1.3-service.dual_role_usb.rc
 
+# Android init.rc sets /tmp to 0771 shell shell, which breaks SailfishOS
+# app semaphores (qtcontacts-sqlite, etc.). Patch it to 1777 root:root.
+patch_rc_init_tmp() {
+    local orig="$1"
+    [ -f "$orig" ] || return 0
+    local tmp
+    tmp=$(mktemp -t hybris-rc.XXXXXX) || return 1
+    sed -e 's/^    chown shell shell \/tmp$/    chown root root \/tmp/' \
+        -e 's/^    chmod 0771 \/tmp$/    chmod 1777 \/tmp/' \
+        "$orig" > "$tmp"
+    if diff -q "$orig" "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        return 0
+    fi
+    mount --bind "$tmp" "$orig" && log "Patched $(basename $orig): /tmp -> 1777 root:root" \
+        || log "WARN: failed to bind-mount init.rc tmp patch for $orig"
+}
+patch_rc_init_tmp /usr/libexec/droid-hybris/system/etc/init/hw/init.rc
+
 # HADK FAQ 13.9: Devices with qseecomd usually have issues getting to UI.
-# Disable it to prevent the restart loop from spamming logs and CPU.
-patch_rc_qseecomd() {
+# Disabled by default to prevent restart loops.
+# TRD-010 DIAGNOSTIC (2026-06-11): qseecomd is required for modem PIL
+# firmware authentication. To capture why it crashes, we temporarily enable
+# it with a stderr wrapper and stdio_to_kmsg. Revert to the disable patch
+# once the crash is understood.
+patch_rc_qseecomd_disable() {
     local orig="$1"
     [ -f "$orig" ] || return 0
     local tmp
@@ -214,7 +358,113 @@ patch_rc_qseecomd() {
         && log "Patched $(basename $orig): disabled qseecomd (starts removed: ${removed:-0})" \
         || log "WARN: failed to bind-mount qseecomd patch for $orig"
 }
-patch_rc_qseecomd /vendor/etc/init/qseecomd.rc
+
+patch_rc_qseecomd_enable() {
+    local orig="$1"
+    [ -f "$orig" ] || return 0
+    local tmp
+    tmp=$(mktemp -t hybris-rc.XXXXXX) || return 1
+    # NOTE: /system/lib64 is REQUIRED here. qseecomd dlopens /system/lib64/libc++.so,
+    # which is NOT present in /vendor/lib64. Removing /system/lib64 causes
+    # `CANNOT LINK EXECUTABLE "/vendor/bin/qseecomd": library "libc++.so" not accessible`
+    # → exit status 1 → crash loop (verified 2026-06-12, and it takes qcrild down with it).
+    # Do NOT strip /system/lib64 from qseecomd to chase the TRD-018 libbinder mix —
+    # qseecomd is not a confirmed source of the SYST/VNDR mismatch (the real offenders
+    # are vendor HALs provider@2.4 and vendor.display.color@1.0). TRD-018 must be fixed
+    # at those HALs, not here.
+    sed -e '/start vendor.qseecomd/d' \
+        -e '/^service vendor.qseecomd /a\    stdio_to_kmsg' \
+        -e '/^service vendor.qseecomd /a\    setenv LD_LIBRARY_PATH /apex/com.android.i18n/lib64:/apex/com.android.conscrypt/lib64:/apex/com.android.runtime/lib64:/vendor/lib64:/system/lib64' \
+        "$orig" > "$tmp"
+    mount --bind "$tmp" "$orig" \
+        && log "Patched $(basename $orig): enabled qseecomd with LD_LIBRARY_PATH + stdio_to_kmsg" \
+        || log "WARN: failed to bind-mount qseecomd enable patch for $orig"
+}
+
+# TRD-010: qseecomd is required for modem PIL firmware authentication.
+# It needs the same APEX LD_LIBRARY_PATH injection we already use for qcrild
+# (libandroidicu.so lives in /apex/com.android.i18n/lib64). Keep the original
+# binary path to avoid SELinux label issues; capture stderr via stdio_to_kmsg.
+patch_rc_qseecomd_enable /vendor/etc/init/qseecomd.rc
+# To disable qseecomd again, replace the above with:
+# patch_rc_qseecomd_disable /vendor/etc/init/qseecomd.rc
+
+# Force qcrild to run in the rild domain. ComputeContextFromExecutable computes
+# the correct domain but never calls setexeccon with it — it only uses the result
+# for socket labels. Without an explicit seclabel, qcrild stays in init domain.
+#
+# TRD-010 FIX: inject `setenv LD_LIBRARY_PATH` so qcrild can resolve libandroidicu.so.
+# qcrild links /system/lib64/libsqlite.so, which needs libandroidicu.so — that lib
+# lives only in the i18n APEX (/apex/com.android.i18n/lib64), and the linker does
+# not search it from the default namespace, so qcrild fails with
+# "CANNOT LINK EXECUTABLE ... libandroidicu.so not found" and exits status 1.
+# Adding the APEX lib dirs to the search path resolves it. (This is what the old
+# bind-mount wrapper's LD_LIBRARY_PATH did; the rc setenv is cleaner — no wrapper,
+# no /tmp copy, no SELinux relabel, and it applies pre-unshare like the seclabel.)
+#
+# DIAGNOSTIC (TRD-010, temporary): `stdio_to_kmsg` redirects qcrild stdout/stderr
+# to /dev/kmsg (captured into $KMSGF). Keep for one boot to confirm the link error
+# is gone, then remove.
+patch_rc_qcrild() {
+    local orig="$1"
+    [ -f "$orig" ] || return 0
+    local tmp
+    tmp=$(mktemp -t hybris-rc.XXXXXX) || return 1
+    # AIRTIGHT (TRD-018): do NOT inject LD_LIBRARY_PATH. qcrild's entire dependency
+    # tree is vendor-resolvable. Its NEEDED libs (libcutils, liblog, libril-qc-hal-qmi,
+    # libhardware_legacy, libutils, libc++, libc, libm, libdl) all live in /vendor, and the
+    # transitive libsqlite pulled via libril-qc-hal-qmi resolves to the SELF-CONTAINED
+    # /vendor/lib64/libsqlite.so (NEEDED: liblog,libc++,libc,libm,libdl — NO libandroidicu,
+    # NO libbinder). The /system libsqlite needs libandroidicu, which is the chain that
+    # dragged in /system/lib64/libbinder.so → "Mixing copies of libbinder" Parcel aborts.
+    # Injecting the apex search paths is precisely what let the /system side win. With pure
+    # vendor-namespace resolution qcrild stays airtight: vendor libsqlite + vendor libc++ +
+    # vendor libbinder only. No /system, no mix — and no libbinder bind-mount needed.
+    sed -e "/^service vendor\.qcrild /a\\    seclabel u:r:rild:s0" \
+        -e "/^service vendor\.qcrild2 /a\\    seclabel u:r:rild:s0" \
+        -e "/^service vendor\.qcrild3 /a\\    seclabel u:r:rild:s0" \
+        -e "/^service vendor\.qcrild /a\\    stdio_to_kmsg" \
+        -e "/^service vendor\.qcrild2 /a\\    stdio_to_kmsg" \
+        -e "/^service vendor\.qcrild3 /a\\    stdio_to_kmsg" \
+        "$orig" > "$tmp"
+    mount --bind "$tmp" "$orig" && log "Patched $(basename $orig): seclabel + stdio_to_kmsg (NO LD_LIBRARY_PATH — airtight vendor resolution, TRD-018)" \
+        || log "WARN: failed to bind-mount qcrild patch for $orig"
+}
+patch_rc_qcrild /vendor/etc/init/qcrild.rc
+
+# Generic patch: inject 'override' + 'disabled' into every service block in the file.
+# Use for Android-only services that have no SailfishOS consumer and just crash-loop.
+patch_rc_disable_service() {
+    local orig="$1"
+    [ -f "$orig" ] || return 0
+    local tmp
+    tmp=$(mktemp -t hybris-rc.XXXXXX) || return 1
+    sed -e '/^service /a\    override\n    disabled' "$orig" > "$tmp"
+    mount --bind "$tmp" "$orig" && log "Patched $(basename $orig): disabled all services" \
+        || log "WARN: failed to bind-mount disable patch for $orig"
+}
+
+# SailfishOS does not use Android keystore, wifi HAL, or capability config store.
+# Disabling them stops the crash-loop spam and reduces boot CPU.
+patch_rc_disable_service /system/etc/init/keystore2.rc
+patch_rc_disable_service /vendor/etc/init/android.hardware.wifi-service.rc
+patch_rc_disable_service /vendor/etc/init/vendor.qti.hardware.capabilityconfigstore@1.0-service.rc
+
+# TRD-018 (TEMPORARY — disabled to silence the libbinder SYST/VNDR mix; proper fix TBD).
+# These two vendor HALs are version-mismatched and each map BOTH /system and /vendor
+# libbinder.so → "Parcel: Expecting header VNDR but found SYST. Mixing copies of
+# libbinder?" (~51×/boot, to kmsg). Confirmed via sfos-diag TRD-018 precise check 2026-06-12:
+#   - android.hardware.camera.provider@2.4-service : 32-bit (Android 35) — 32-bit libbinder split
+#   - vendor.display.color@1.0-service             : 64-bit but Android-30 vintage (libhidltransport)
+# Neither is used by SailfishOS today (Mesa/KMS drives display; the QTI color HAL is unused).
+# ---- WHEN FIXING LATER ----
+# * display.color@1.0 is safe to leave disabled (SFOS has no consumer).
+# * camera.provider@2.4 is the SFOS camera HAL (jolla-camera→gst-droid→droidmedia talk to it
+#   directly; this is SEPARATE from the disabled libhybris camera compat layer). RE-ENABLE this
+#   line before any camera bring-up, and instead fix the 32-bit libbinder resolution (or use a
+#   64-bit camera provider if one exists for perseus).
+patch_rc_disable_service /vendor/etc/init/android.hardware.camera.provider@2.4-service.rc
+patch_rc_disable_service /vendor/etc/init/vendor.display.color@1.0-service.rc
 
 # Clean up stale init state
 [ -e /dev/kmsg_debug ] && rm -f /dev/kmsg_debug && log "Removed stale /dev/kmsg_debug"
@@ -238,35 +488,140 @@ else
     log "linkerconfig dir: $(ls -lA /linkerconfig 2>&1 | tr '\n' ' ')"
 fi
 
-# Ensure linkerconfig is large enough and contains vendor paths.
-# Early-init may have written to the initramfs which gets discarded after switch_root.
-if [ ! -f /linkerconfig/ld.config.txt ] || [ "$(stat -c %s /linkerconfig/ld.config.txt 2>/dev/null || echo 0)" -lt 1000 ]; then
-    log "Regenerating /linkerconfig/ld.config.txt for Android 15..."
-    mkdir -p /linkerconfig
-    cat > /linkerconfig/ld.config.txt <<'LDCFG'
-dir.system = /system/bin
-dir.vendor = /vendor/bin
-
-[system]
-additional.namespaces = default
-namespace.default.isolated = false
-namespace.default.search.paths = /system/lib64/bootstrap:/system/lib64:/system/lib64/hw:/system_ext/lib64:/product/lib64:/odm/lib64:/apex/com.android.runtime/lib64:/apex/com.android.i18n/lib64:/apex/com.android.conscrypt/lib64
-namespace.default.permitted.paths = /system:/vendor:/system_ext:/product:/odm:/apex:/data
-
-[vendor]
-additional.namespaces = default
-namespace.default.isolated = false
-namespace.default.search.paths = /vendor/lib64:/vendor/lib64/hw:/system/lib64/bootstrap:/system/lib64:/system/lib64/hw:/system_ext/lib64:/product/lib64:/odm/lib64:/apex/com.android.runtime/lib64:/apex/com.android.i18n/lib64:/apex/com.android.conscrypt/lib64
-namespace.default.permitted.paths = /system:/vendor:/system_ext:/product:/odm:/apex:/data
-LDCFG
-    log "linkerconfig regenerated: $(wc -c < /linkerconfig/ld.config.txt) bytes"
+# The linkerconfig must be the full Android-generated one with ${LIB} substitution
+# so that both 32-bit and 64-bit vendor binaries (e.g. HIDL audio HAL) can find
+# their libraries in /vendor/lib and /vendor/lib64 respectively.
+# A copy is kept at /mnt/vendor/persist/ld.config.txt so it survives Android→SailfishOS
+# reboots (Android regenerates /linkerconfig on each boot; switch_root discards it).
+PERSIST_LDCFG=/mnt/vendor/persist/ld.config.txt
+LIVE_LDCFG=/linkerconfig/ld.config.txt
+mkdir -p /linkerconfig
+lc_size="$(stat -c %s $LIVE_LDCFG 2>/dev/null || echo 0)"
+if [ "$lc_size" -ge 100000 ]; then
+    # Full Android-generated linkerconfig is present — save a backup for next boot
+    cp -f $LIVE_LDCFG $PERSIST_LDCFG 2>/dev/null \
+        && log "linkerconfig ok (${lc_size}b): saved backup to persist" \
+        || log "linkerconfig ok (${lc_size}b): backup save failed"
+elif [ -f $PERSIST_LDCFG ] && [ "$(stat -c %s $PERSIST_LDCFG 2>/dev/null || echo 0)" -ge 100000 ]; then
+    # Restore from last good copy saved from Android boot
+    cp -f $PERSIST_LDCFG $LIVE_LDCFG \
+        && log "linkerconfig restored from persist ($(wc -c < $LIVE_LDCFG)b)" \
+        || log "WARN: linkerconfig restore from persist failed"
+else
+    log "WARN: no full linkerconfig available (${lc_size}b) — vendor 32-bit HALs may fail to load"
+    log "  To fix: boot into Android once to regenerate /linkerconfig, then reboot to SailfishOS"
 fi
+log "linkerconfig: $(wc -c < $LIVE_LDCFG 2>/dev/null || echo '?')b, ${LIB}-capable: $(grep -c '\${LIB}' $LIVE_LDCFG 2>/dev/null || echo 0) paths"
 
-# Ensure /data exists for HAL services that expect Android data paths
+# qcrild/vendor-HAL fix: the persisted Android linkerconfig isolates the [vendor]
+# namespace from /system (permitted.paths lacks /system). But vendor binaries
+# (qcrild, qseecomd, and many HALs) dlopen /system/lib64/libc++.so — the runtime
+# APEX only symlinks libc++.so back to /system, it ships no own copy. Without
+# /system access they fail "CANNOT LINK ... libc++.so not accessible for namespace
+# (default)" and crash-loop. We append /system/${LIB} to the [vendor] default
+# namespace, placed AFTER /vendor/${LIB} so libbinder.so still resolves to /vendor
+# FIRST (single copy in one namespace → no SYST/VNDR "Mixing copies of libbinder").
+# Patches the LIVE config only (persist stays pristine — backed up above). Idempotent.
+patch_vendor_linkerconfig() {
+    local cfg=$LIVE_LDCFG
+    [ -f "$cfg" ] || { log "WARN: no linkerconfig to patch for /system access"; return 0; }
+    if awk '/^\[/{s=$0} s=="[vendor]" && /^namespace\.default\.search\.paths \+= \/system\/\$\{LIB\}/{f=1} END{exit !f}' "$cfg"; then
+        log "vendor linkerconfig already grants /system access — skipping"
+        return 0
+    fi
+    local tmp; tmp=$(mktemp -t ldcfg.XXXXXX) || return 1
+    awk '
+      /^\[/ { invendor = ($0=="[vendor]") }
+      { print }
+      invendor && $0=="namespace.default.search.paths += /vendor/${LIB}/egl" { print "namespace.default.search.paths += /system/${LIB}" }
+      invendor && $0=="namespace.default.permitted.paths += /system/vendor" { print "namespace.default.permitted.paths += /system" }
+    ' "$cfg" > "$tmp"
+    # Verify BOTH lines landed in [vendor] before committing — a partial patch
+    # (permitted without search) would still fail to link, so refuse it.
+    local got
+    got=$(awk '/^\[/{s=$0} s=="[vendor]" && (/^namespace\.default\.search\.paths \+= \/system\/\$\{LIB\}/ || /^namespace\.default\.permitted\.paths \+= \/system$/)' "$tmp" | wc -l)
+    if [ "$got" -eq 2 ]; then
+        cat "$tmp" > "$cfg" && log "Patched vendor linkerconfig: +/system/\${LIB} search + /system permitted ([vendor] only, after /vendor)" \
+            || log "WARN: failed to write patched linkerconfig"
+    else
+        log "WARN: vendor linkerconfig patch produced $got/2 expected lines — NOT applied (config format drift?)"
+    fi
+    rm -f "$tmp"
+}
+patch_vendor_linkerconfig
+
+# Ensure /data exists for HAL services that expect Android data paths.
+# TRD-010: qcrild and droid-hal-init need Android /data/property (persist
+# properties) and /data/vendor/modem_config. The Sailfish rootfs lives on the
+# userdata partition, and after switch_root the original Android /data directory
+# is no longer visible. Android /data is also FBE-encrypted, so it cannot simply
+# be bind-mounted. We keep a tmpfs /data and populate the specific files that
+# the modem stack needs from the firmware partition and a pre-captured snapshot.
 if ! mountpoint -q /data 2>/dev/null; then
     mkdir -p /data
     mount -t tmpfs -o mode=0755,size=64m tmpfs /data && log "Mounted tmpfs on /data"
 fi
+
+# TRD-010: If Android's decrypted /data/vendor tree is not available (e.g.
+# FBE-encrypted userdata), qcrild still needs a populated /data/vendor/modem_config
+# to boot the modem. Copy the mcfg files from the firmware partition.
+populate_modem_config() {
+    local src=/vendor/firmware_mnt/image/modem_pr/mcfg/configs
+    local dst=/data/vendor/modem_config
+    if [ -d "$dst/mcfg_sw" ] && [ -n "$(ls -A "$dst/mcfg_sw" 2>/dev/null)" ]; then
+        log "modem_config already populated"
+        return 0
+    fi
+    if [ ! -d "$src" ]; then
+        log "WARN: modem config source $src not found"
+        return 1
+    fi
+    mkdir -p "$dst"
+    cp -a "$src"/* "$dst/" 2>/dev/null && \
+        log "Populated $dst from $src ($(find "$dst" -type f 2>/dev/null | wc -l) files)" \
+        || log "WARN: failed to populate $dst"
+    chown -R radio:root "$dst" 2>/dev/null || true
+    chmod -R 0440 "$dst" 2>/dev/null || true
+    find "$dst" -type d -exec chmod 0550 {} + 2>/dev/null || true
+}
+populate_modem_config
+
+# TRD-010: Android's /data/property is FBE-encrypted and not directly readable
+# from Sailfish. Copy the persist property snapshot taken from Android into the
+# legacy /data/property directory so droid-hal-init loads them for qcrild.
+populate_persist_properties() {
+    local src=/etc/hybridos/persist-props.txt
+    local bin_src=/etc/hybridos/persistent_properties
+    local dst=/data/property
+    mkdir -p "$dst"
+
+    # Android 10+ stores persist props in a single binary file; copy it verbatim
+    # if available so droid-hal-init's property service loads it natively.
+    if [ -f "$bin_src" ]; then
+        cp -a "$bin_src" "$dst/persistent_properties" 2>/dev/null \
+            && log "Copied $bin_src -> $dst/persistent_properties" \
+            || log "WARN: failed to copy $bin_src"
+        chmod 600 "$dst/persistent_properties" 2>/dev/null || true
+    fi
+
+    if [ ! -f "$src" ]; then
+        log "WARN: persist property snapshot $src not found"
+        return 1
+    fi
+    # droid-hal-init legacy mode: one file per property, filename = property name
+    while IFS='=' read -r key value; do
+        [ -z "$key" ] && continue
+        # Skip keys with invalid characters for a filename
+        if printf '%s' "$key" | grep -q '[/"\\]'; then
+            continue
+        fi
+        printf '%s' "$value" > "$dst/$key" 2>/dev/null || true
+    done < "$src"
+    # droid-hal-init reads these as root; keep ownership permissive
+    chmod -R 600 "$dst" 2>/dev/null || true
+    log "Populated $dst with $(find "$dst" -maxdepth 1 -type f 2>/dev/null | wc -l) persist properties from $src"
+}
+populate_persist_properties
 
 # Fallback: mount firmware partitions if systemd units failed
 if ! mountpoint -q /vendor/firmware_mnt 2>/dev/null; then
@@ -319,48 +674,28 @@ mount_stub /system/bin/vdc
 # Stub it so droid-hal-init's launch of vendor.hwcomposer-2-3 exits immediately.
 mount_stub /vendor/bin/hw/android.hardware.graphics.composer@2.3-service
 
-# Populate /apex tmpfs for Android 15 APEX bionic.
-# /system is already mounted by the .mount units before this service runs.
-# We populate here, before android_init starts.
-if ! mountpoint -q /apex 2>/dev/null; then
-    mkdir -p /apex
-    mount -t tmpfs -o mode=0755,size=32m tmpfs /apex && log "Mounted tmpfs on /apex"
-fi
-if [ ! -x /apex/com.android.runtime/bin/linker64 ] && [ -f /system/bin/bootstrap/linker64 ]; then
-    log "Populating APEX runtime from /system/bin/bootstrap"
-    mkdir -p /apex/com.android.runtime/bin \
-              /apex/com.android.runtime/lib64/bionic \
-              /apex/com.android.runtime/lib/bionic
-    for b in linker64 linker linker_asan linker_asan64 linker_hwasan64; do
-        src="/system/bin/bootstrap/$b"
-        [ -f "$src" ] && cp "$src" "/apex/com.android.runtime/bin/$b"
-    done
-    for f in libc.so libdl.so libm.so libdl_android.so; do
-        src="/system/lib64/bootstrap/$f"
-        if [ -f "$src" ]; then
-            cp "$src" "/apex/com.android.runtime/lib64/bionic/$f"
-            ln -sf "bionic/$f" "/apex/com.android.runtime/lib64/$f"
-        fi
-        src="/system/lib/bootstrap/$f"
-        if [ -f "$src" ]; then
-            cp "$src" "/apex/com.android.runtime/lib/bionic/$f"
-            ln -sf "bionic/$f" "/apex/com.android.runtime/lib/$f"
-        fi
-    done
-    log "APEX populated: bin=$(ls /apex/com.android.runtime/bin/ 2>/dev/null | wc -w) lib64=$(ls /apex/com.android.runtime/lib64/bionic/ 2>/dev/null | wc -w)"
-fi
-
 # Pre-flight checks for Android 15 HAL prerequisites
-if [ -x /apex/com.android.runtime/bin/linker64 ]; then
-    log "APEX linker64: OK"
-else
-    log "WARN: APEX linker64 missing - Android 15 binaries may fail to start"
-fi
 if [ -f /linkerconfig/ld.config.txt ]; then
     log "Linkerconfig: OK ($(wc -l < /linkerconfig/ld.config.txt) lines)"
 else
     log "WARN: /linkerconfig/ld.config.txt missing"
 fi
+
+# TRD-018: qcrild (and other vendor HALs) end up loading both
+# /system/lib64/libbinder.so and /vendor/lib64/libbinder.so. The two copies
+# have different build IDs and libbinder's runtime header check aborts IPC
+# transactions with "Mixing copies of libbinder". Force every process in the
+# Android container to use the vendor copy by bind-mounting it over the system
+# path. This is safe because the vendor variant is a superset of the system ABI.
+for libdir in lib lib64; do
+    sys="/system/${libdir}/libbinder.so"
+    ven="/vendor/${libdir}/libbinder.so"
+    if [ -f "$sys" ] && [ -f "$ven" ]; then
+        mount --bind "$ven" "$sys" 2>/dev/null \
+            && log "TRD-018: bound $ven -> $sys" \
+            || log "WARN: failed to bind $ven -> $sys"
+    fi
+done
 
 # Mesa KMS mode: we do NOT need HWComposer/hwservicemanager for graphics.
 # droid-hal-init still runs for audio, sensors, GPS, etc.
@@ -380,6 +715,13 @@ for fw in a630_sqe.fw a630_gmu.bin a630_zap.mdt a630_zap.b00 a630_zap.b01 a630_z
 done
 log "GPU firmware: $(ls /lib/firmware/a630* 2>/dev/null | wc -l) a630 files linked"
 
+# TAS2557 smart-amp DSP firmware (loudspeaker PA): NOT symlinked here. The kernel
+# requests tas2557_uCDSP.bin at i2c coldplug — far earlier than this script and before
+# /vendor is mounted — so a runtime symlink is always too late and would clobber the
+# real file. Instead the firmware ships as a real file in the rootfs at
+# /lib/firmware/tas2557_uCDSP.bin (droid-configs sparse tree), which the kernel's direct
+# loader finds on the SailfishOS udev re-trigger regardless of /vendor mount timing (TRD-017).
+
 # lipstick setgid removal is handled by systemd ExecStartPre=+/bin/chmod g-s
 # in lipstick.service.d/99-mesa-kms.conf. That drop-in runs as root inside the
 # SailfishOS namespace, which is reliable. This is a belt-and-suspenders fallback
@@ -389,7 +731,32 @@ log "lipstick setgid: chmod exit=$CHMOD_RC${CHMOD_OUT:+ err: $CHMOD_OUT} perms=$
 # Ensure qcrild runtime environment exists before droid-hal-init triggers it.
 # init.qcom.rc's post-fs-data block creates these, but in the hybris namespace
 # it may run too late (or not at all), causing qcrild to exit status 1.
+# Create modem block-device nodes and by-name symlinks for qcril/rmt_storage.
+# ueventd in the hybris namespace cannot read uevents ("Uevent Fd: I/O error"),
+# so /dev/block is never populated and the by-name directory does not exist.
+# qcrild opens modemst1/modemst2 (EFS/NV storage) on init and exits status 1
+# when they are missing. We create only the radio partitions qcril needs.
+# major:minor values are perseus/sdm845-specific (read from Android /dev/block).
+setup_modem_block_nodes() {
+    local byname=/dev/block/platform/soc/1d84000.ufshc/by-name
+    mkdir -p "$byname" /dev/block/bootdevice
+    ln -sf platform/soc/1d84000.ufshc/by-name /dev/block/bootdevice/by-name 2>/dev/null
+    # node            type maj min   partition
+    create_node /dev/block/sde46 b 259 37   # modem
+    create_node /dev/block/sdf6  b 8   86   # modemst1
+    create_node /dev/block/sdf7  b 8   87   # modemst2
+    create_node /dev/block/sde36 b 259 27   # fsg
+    create_node /dev/block/sdf1  b 8   81   # fsc
+    ln -sf /dev/block/sde46 "$byname/modem"    2>/dev/null
+    ln -sf /dev/block/sdf6  "$byname/modemst1" 2>/dev/null
+    ln -sf /dev/block/sdf7  "$byname/modemst2" 2>/dev/null
+    ln -sf /dev/block/sde36 "$byname/fsg"      2>/dev/null
+    ln -sf /dev/block/sdf1  "$byname/fsc"      2>/dev/null
+    log "modem block nodes: $(ls $byname 2>/dev/null | tr '\n' ' ')"
+}
+
 ensure_qcrild_env() {
+    setup_modem_block_nodes
     mkdir -p /data/vendor/radio /data/vendor/netmgr /data/vendor/port_bridge \
              /data/vendor/connectivity /data/vendor/modem_config \
              /dev/socket/qmux_radio
@@ -417,63 +784,113 @@ ensure_qcrild_env() {
     chown radio:radio /data/vendor/radio/db_check_done
     chmod 0660 /data/vendor/radio/db_check_done
 
-    # Keep qcrild stderr on the persist partition; tmpfs /data is lost on reboot.
     mkdir -p /mnt/vendor/persist/radio
     chown radio:radio /mnt/vendor/persist/radio
     chmod 0770 /mnt/vendor/persist/radio
-    touch /mnt/vendor/persist/radio/qcrild.log
-    chown radio:radio /mnt/vendor/persist/radio/qcrild.log
-    chmod 0660 /mnt/vendor/persist/radio/qcrild.log
 
     log "qcrild env: /data/vendor/radio and /mnt/vendor/persist/radio prepared"
 }
 
-# Wrap qcrild to capture its stderr. droid-hal-init swallows service stderr by
-# default, so we bind-mount a wrapper that logs to the persist partition.
-install_qcrild_wrapper() {
-    local real=/vendor/bin/hw/qcrild
-    local wrap=/tmp/qcrild-wrapper
-    local bak=/tmp/qcrild.real
-    local logf=/mnt/vendor/persist/radio/qcrild.log
-    [ -x "$real" ] || return 0
-    cp -af "$real" "$bak" 2>/dev/null || return 0
-    cat > "$wrap" <<WRAP
-#!/system/bin/sh
-# Preserve one prior invocation on the persist partition.
-[ -f $logf ] && cp -f $logf ${logf}.prev 2>/dev/null
-# The real binary is at /tmp/qcrild.real which falls into the default linker
-# namespace (not vendor). Ensure APEX libs are discoverable.
-export LD_LIBRARY_PATH=/apex/com.android.i18n/lib64:/apex/com.android.conscrypt/lib64:/apex/com.android.runtime/lib64:/vendor/lib64:/system/lib64:\${LD_LIBRARY_PATH}
-exec $bak "\$@" > $logf 2>&1
-WRAP
-    chmod 755 "$wrap"
-    mount --bind "$wrap" "$real" 2>/dev/null && log "Wrapped $real -> $wrap (log: $logf)"
-}
-
 ensure_qcrild_env
+
+# APEX baseline fix: create the device-mapper control node so apexd can activate
+# APEX packages the normal Android way. Each APEX is a dm-verity/dm-linear device;
+# apexd opens /dev/device-mapper (the Android path — dmsetup/LVM use the same
+# device via /dev/mapper/control). Without this node, apexd-bootstrap fails with
+# "Failed to open device-mapper: No such file or directory" → DM_DEV_CREATE fails
+# for every package → NO APEX activates, including com.android.runtime (which holds
+# the linkerconfig binary). That is the root cause of the hand-faked /apex fixture
+# and the frozen /linkerconfig snapshot. The misc minor is dynamic — read it from
+# /proc/misc. Created pre-unshare so it's visible in droid-hal-init's namespace
+# (shared /dev devtmpfs). Additive: if this fails, the persist-restore fallback
+# (droid-hal-early-init) still provides a working linkerconfig.
+if [ ! -e /dev/device-mapper ]; then
+    dm_minor=$(awk '$2=="device-mapper"{print $1}' /proc/misc 2>/dev/null)
+    if [ -n "$dm_minor" ]; then
+        mknod /dev/device-mapper c 10 "$dm_minor" && chmod 600 /dev/device-mapper \
+            && log "Created /dev/device-mapper (c 10 $dm_minor) for apexd" \
+            || log "WARN: mknod /dev/device-mapper failed"
+    else
+        log "WARN: device-mapper minor not in /proc/misc — apexd APEX activation will fail"
+    fi
+fi
+
 log "Starting droid-hal-init (Mesa KMS mode — no HWC2 required)..."
+# Run droid-hal-init in the same mount namespace as this service. APEX mounts
+# made by apexd will then be visible to the startup script, allowing setprop,
+# logcat and other dynamically-linked Android tools to resolve the runtime APEX.
+
+# Checkpoint 2: last sanity check before handing off to Android init.
+ensure_permissive "pre-droid-hal-init"
 /sbin/droid-hal-init >> $LOGF 2>&1 &
 INIT_PID=$!
 log "droid-hal-init PID=$INIT_PID"
 
-# Brief wait for hwservicemanager (needed by audio HIDL and other non-graphics HALs).
-log "Waiting for hwservicemanager (non-graphics HALs)..."
-for i in $(seq 1 10); do
+# Checkpoint 3: catch resets during first-stage -> selinux_setup -> second_stage.
+ensure_permissive "post-droid-hal-init-start"
+
+# Notify systemd immediately that droid-hal-init is alive.
+# The script continues polling hwservicemanager/qcrild, but systemd
+# must know the service is running so it doesn't hit TimeoutSec.
+systemd-notify --ready 2>/dev/null && log "Sent sd_notify READY (early)"
+
+# Wait for hwservicemanager process to be running before qcrild starts.
+# lshal is unusable here — SELinux denies service_manager find in u:r:init:s0
+# even in permissive mode (permissive=0 on that AVC). Process presence is enough:
+# hwservicemanager registers the hwbinder socket on startup before accepting clients.
+log "Waiting for hwservicemanager to be ready..."
+HWSM_READY=0
+for i in $(seq 1 15); do
     if pgrep -f hwservicemanager >/dev/null 2>&1; then
-        log "hwservicemanager detected"
+        log "hwservicemanager ready (process detected after ${i}s)"
+        HWSM_READY=1
         break
     fi
     sleep 1
 done
+if [ "$HWSM_READY" -eq 0 ]; then
+    log "WARNING: hwservicemanager not detected after 15s, starting qcrild anyway"
+fi
 
-# Give droid-hal-init's post-fs-data action time to run before we start qcrild.
-# Starting it too early causes exit status 1 because /data/vendor/radio is not ready.
-sleep 2
-install_qcrild_wrapper
+# DIAGNOSTICS: SELinux runtime state and process domains.
+# hwservicemanager may fail silently if its domain is wrong or if the
+# kernel is actually enforcing despite security_setenforce(0) success.
+log "DIAG: /sys/fs/selinux/enforce = $(cat /sys/fs/selinux/enforce 2>/dev/null || echo 'N/A')"
+HWSM_PID=$(pgrep -f hwservicemanager 2>/dev/null | head -1)
+if [ -n "$HWSM_PID" ] && [ -f /proc/$HWSM_PID/attr/current ]; then
+    log "DIAG: hwservicemanager PID $HWSM_PID domain = $(cat /proc/$HWSM_PID/attr/current 2>/dev/null || echo 'N/A')"
+fi
+INIT_CTX_PID=$(pgrep -f droid-hal-init 2>/dev/null | head -1)
+if [ -n "$INIT_CTX_PID" ] && [ -f /proc/$INIT_CTX_PID/attr/current ]; then
+    log "DIAG: droid-hal-init PID $INIT_CTX_PID domain = $(cat /proc/$INIT_CTX_PID/attr/current 2>/dev/null || echo 'N/A')"
+fi
+
+# TRD-018: Finish APEX setup. apexd bind-mounts activated APEX at /apex/<name>;
+# compressed APEX (conscrypt) fails to decompress, so we populate a minimal
+# fallback. This must run before qcrild starts so its APEX LD_LIBRARY_PATH
+# resolves.
+if [ -x /usr/bin/droid/apex-post-setup.sh ]; then
+    log "Running APEX post-setup"
+    if /usr/bin/droid/apex-post-setup.sh >> $LOGF 2>&1; then
+        log "APEX post-setup completed"
+    else
+        log "WARN: APEX post-setup failed (rc=$?)"
+    fi
+else
+    log "WARN: apex-post-setup.sh not found"
+fi
+
+# Additional stabilization delay: droid-hal-init's post-fs-data action and
+# vendor HAL .rc parsing must complete before qcrild starts, otherwise
+# RilServiceModule_1_4 races qcril_init dispatch.
+sleep 3
+
+# Checkpoint 4: before starting vendor HAL services that crash when enforcing.
+ensure_permissive "pre-hal-services"
 
 # Explicitly start HAL services that were disabled by class_start main removal.
 # Audio, vibrator and radio are in class main/late_start, so they don't auto-start.
-for svc in vendor.audio-hal vendor.qti.vibrator vendor.qcrild; do
+for svc in vendor.qti.vibrator vendor.qcrild; do
     if [ -x /system/bin/setprop ]; then
         /system/bin/setprop ctl.start "$svc" 2>/dev/null && log "Started $svc via setprop"
     elif [ -x /vendor/bin/setprop ]; then
@@ -483,11 +900,63 @@ for svc in vendor.audio-hal vendor.qti.vibrator vendor.qcrild; do
     fi
 done
 
+# Checkpoint 5: after vendor HAL services have been triggered.
+ensure_permissive "post-hal-services"
+
+# Checkpoint 6: start background watchdog to catch later flip-backs.
+poll_permissive &
+PERMISSIVE_POLL_PID=$!
+log "Started SELinux permissive watchdog (PID $PERMISSIVE_POLL_PID)"
+
 # No HWC2 wait needed — Mesa uses DRM/KMS directly.
 log "Mesa KMS: skipping HWC2 service wait"
 
-# Tell systemd we are ready
-systemd-notify --ready 2>/dev/null && log "Sent sd_notify READY"
+# Wait for qcrild to start. lshal is blocked by SELinux (service_manager find
+# denied in u:r:init:s0 even with permissive=0), so we detect by process presence.
+# oFono queries the HIDL registry directly via hwbinder — it does not depend on
+# lshal. Process presence is a sufficient proxy for the service being up.
+log "Waiting for qcrild to start..."
+QCRILD_READY=0
+for i in $(seq 1 20); do
+    if pgrep -f qcrild >/dev/null 2>&1; then
+        log "qcrild process detected after ${i}s"
+        QCRILD_READY=1
+        break
+    fi
+    sleep 1
+done
+QCRILD_PID=$(pgrep -f qcrild 2>/dev/null | head -1)
+if [ -n "$QCRILD_PID" ] && [ -f /proc/$QCRILD_PID/attr/current ]; then
+    log "DIAG: qcrild PID $QCRILD_PID domain = $(cat /proc/$QCRILD_PID/attr/current 2>/dev/null || echo 'N/A')"
+fi
+log "DIAG: /dev/hwbinder context = $(/system/bin/ls -Z /dev/hwbinder 2>/dev/null | awk '{print $5}' || echo 'N/A')"
+
+# TRD-010 Part 2 DIAGNOSTIC (temporary): qcrild runs but never registers
+# android.hardware.radio@1.4::IRadio, so oFono times out. qcril logs operationally
+# via Android liblog -> logd (not stderr), so stdio_to_kmsg shows nothing. Start logd
+# explicitly (its `start logd` is stripped by patch_rc_init_hybris) and capture the
+# radio/system buffers to a file we can pull from Android. Remove once diagnosed.
+if /system/bin/setprop ctl.start logd 2>/dev/null; then
+    log "TRD-010 diag: started logd"
+    sleep 2
+    /system/bin/logcat -b radio -b system -b main -v time > /var/log/qcril-logcat.log 2>&1 &
+    log "TRD-010 diag: logcat capture -> /var/log/qcril-logcat.log (PID $!)"
+else
+    log "TRD-010 diag: could not start logd (logcat capture skipped)"
+fi
+
+if [ "$QCRILD_READY" -eq 0 ]; then
+    log "WARNING: qcrild not detected after 20s, attempting restart..."
+    /system/bin/setprop ctl.stop vendor.qcrild 2>/dev/null
+    sleep 1
+    /system/bin/setprop ctl.start vendor.qcrild 2>/dev/null && log "Restarted vendor.qcrild"
+    sleep 5
+    if pgrep -f qcrild >/dev/null 2>&1; then
+        log "qcrild started after restart"
+    else
+        log "WARNING: qcrild still not running after restart, oFono may fail to find IRadio"
+    fi
+fi
 
 # Wait for droid-hal-init to exit
 wait $INIT_PID
