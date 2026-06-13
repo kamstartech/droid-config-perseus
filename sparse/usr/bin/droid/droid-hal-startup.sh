@@ -3,81 +3,6 @@ LOGF=/var/log/droid-hal-debug.log
 KMSGF=/var/log/droid-hal-kmsg.log
 log() { echo "$(date '+%H:%M:%S') startup: $*" >> $LOGF; echo "droid-hal-startup: $*" > /dev/kmsg 2>/dev/null; }
 
-ensure_permissive() {
-    local tag="${1:-unknown}"
-    local i=0
-    local max=5
-    local sys_state ge_state
-
-    while [ "$i" -lt "$max" ]; do
-        sys_state=$(cat /sys/fs/selinux/enforce 2>/dev/null || echo '?')
-        ge_state=$(/system/bin/getenforce 2>/dev/null || echo 'Unknown')
-
-        if [ "$sys_state" = "0" ] && { [ "$ge_state" = "Permissive" ] || [ "$ge_state" = "Unknown" ]; }; then
-            [ "$i" -gt 0 ] && log "ensure_permissive[$tag]: stable after $i attempt(s)"
-            return 0
-        fi
-
-        log "ensure_permissive[$tag]: sys=$sys_state getenforce=$ge_state -> forcing permissive (attempt $((i+1))/$max)"
-        echo 0 > /sys/fs/selinux/enforce 2>/dev/null || log "WARN: ensure_permissive[$tag]: cannot write /sys/fs/selinux/enforce"
-        i=$((i + 1))
-        sleep 0.2
-    done
-
-    log "WARN: ensure_permissive[$tag]: could not stabilize permissive after $max attempts"
-    return 1
-}
-
-scan_selinux_setters() {
-    log "SELinux setter scan:"
-    grep -RsnE 'setenforce|write[[:space:]]+/sys/fs/selinux/enforce' \
-        /system/etc/init /system/etc/init/hw /vendor/etc/init /vendor/etc/init/hw \
-        /usr/libexec/droid-hybris/system/etc/init /usr/libexec/droid-hybris/system/etc/init/hw \
-        2>/dev/null | while read -r line; do
-        log "  setter: $line"
-    done
-}
-
-snapshot_on_flip() {
-    local tag="$1"
-    log "SELinux flip-back detected at $tag"
-    log "  processes: $(pgrep -a 2>/dev/null | tr '\n' ';' || ps 2>/dev/null | tr '\n' ';')"
-    log "  dmesg tail: $(dmesg | tail -n 30 | tr '\n' '|')"
-    log "  startup log tail: $(tail -n 20 "$LOGF" | tr '\n' '|')"
-}
-
-poll_permissive() {
-    set +e
-    local duration=120
-    local interval=2
-    local elapsed=0
-    local last_sys last_ge
-
-    last_sys=$(cat /sys/fs/selinux/enforce 2>/dev/null || echo '?')
-    last_ge=$(/system/bin/getenforce 2>/dev/null || echo 'Unknown')
-
-    while [ "$elapsed" -lt "$duration" ]; do
-        sleep "$interval"
-        elapsed=$((elapsed + interval))
-
-        local sys_state ge_state
-        sys_state=$(cat /sys/fs/selinux/enforce 2>/dev/null || echo '?')
-        ge_state=$(/system/bin/getenforce 2>/dev/null || echo 'Unknown')
-
-        if [ "$sys_state" != "$last_sys" ] || [ "$ge_state" != "$last_ge" ]; then
-            log "poll_permissive: state changed sys=$last_sys->$sys_state getenforce=$last_ge->$ge_state"
-            if [ "$sys_state" = "1" ] || [ "$ge_state" = "Enforcing" ]; then
-                snapshot_on_flip "poll+$elapsed"
-                ensure_permissive "poll+$elapsed"
-            fi
-            last_sys="$sys_state"
-            last_ge="$ge_state"
-        fi
-    done
-
-    log "poll_permissive: watchdog exiting after ${duration}s"
-}
-
 log "startup.sh running"
 echo 0 > /proc/sys/kernel/printk_ratelimit 2>/dev/null
 echo 0 > /proc/sys/kernel/printk_ratelimit_burst 2>/dev/null
@@ -198,10 +123,6 @@ touch /dev/.hybris_selinux_real 2>/dev/null \
 /system/bin/chcon u:object_r:hwbinder_device:s0 /dev/hwbinder 2>/dev/null || log "WARN: chcon /dev/hwbinder failed"
 /system/bin/chcon u:object_r:vndbinder_device:s0 /dev/vndbinder 2>/dev/null || log "WARN: chcon /dev/vndbinder failed"
 
-# Checkpoint 1: baseline SELinux permissive before RC patching.
-ensure_permissive "post-selinuxfs-mount"
-scan_selinux_setters
-
 # Remove reboot_on_failure directives from Android init RC files.
 # We ensure the Sailfish root is RW as permitted, but /system remains read-only.
 mount -o remount,rw / 2>/dev/null
@@ -261,6 +182,10 @@ patch_rc_display_hal() {
 }
 
 patch_rc_no_reboot /system/etc/init/vold.rc
+# SailfishOS does not use Android vold; leaving it enabled causes a crash loop
+# on this Android 15 base because /system/bin/vold links a libbinder symbol that
+# is missing after the TRD-018 vendor libbinder bind-mount.
+patch_rc_disable_service /system/etc/init/vold.rc
 patch_rc_no_reboot /system/etc/init/netbpfload.rc
 patch_rc_init_hybris /system/etc/init/hw/init.rc
 patch_rc_init_hybris /system/etc/init/logd.rc
@@ -456,7 +381,7 @@ patch_rc_disable_service /vendor/etc/init/vendor.qti.hardware.capabilityconfigst
 # libbinder?" (~51×/boot, to kmsg). Confirmed via sfos-diag TRD-018 precise check 2026-06-12:
 #   - android.hardware.camera.provider@2.4-service : 32-bit (Android 35) — 32-bit libbinder split
 #   - vendor.display.color@1.0-service             : 64-bit but Android-30 vintage (libhidltransport)
-# Neither is used by SailfishOS today (Mesa/KMS drives display; the QTI color HAL is unused).
+# Neither is used by SailfishOS today (HWComposer drives display; the QTI color HAL is unused).
 # ---- WHEN FIXING LATER ----
 # * display.color@1.0 is safe to leave disabled (SFOS has no consumer).
 # * camera.provider@2.4 is the SFOS camera HAL (jolla-camera→gst-droid→droidmedia talk to it
@@ -643,24 +568,13 @@ fi
 
 # Tell systemd we are ready
 
-# Forcibly stop Android's graphics services if they are already running.
-# With Mesa KMS we don't need hwcomposer, but we still stub surfaceflinger
-# and bootanimation to prevent them from seizing the display.
-for svc in surfaceflinger bootanim vendor.hwcomposer-2-3 vendor.livedisplay-sdm; do
-    if pgrep -f $svc >/dev/null; then
-        log "$svc detected - stopping..."
-        stop $svc 2>/dev/null
-        killall -9 $svc 2>/dev/null
-    fi
-done
-
-# Create a persistent stub that returns success immediately.
+# Stub SurfaceFlinger and bootanimation — libhybris EGL renders directly
+# via HWComposer so SF must not run. HWComposer itself is NOT stubbed.
 STUB_BIN=/tmp/hybris-stub
 echo '#!/bin/sh' > $STUB_BIN
 echo 'exit 0' >> $STUB_BIN
 chmod 755 $STUB_BIN
 
-# Stub Android graphics services so they don't compete with Mesa for DRM/KMS.
 mount_stub() {
     local target="$1"
     [ -x "$target" ] || return 0
@@ -670,9 +584,6 @@ mount_stub() {
 mount_stub /system/bin/surfaceflinger
 mount_stub /system/bin/bootanimation
 mount_stub /system/bin/vdc
-# HWC takes DRM master from /dev/dri/card0, blocking Mesa KMS.
-# Stub it so droid-hal-init's launch of vendor.hwcomposer-2-3 exits immediately.
-mount_stub /vendor/bin/hw/android.hardware.graphics.composer@2.3-service
 
 # Pre-flight checks for Android 15 HAL prerequisites
 if [ -f /linkerconfig/ld.config.txt ]; then
@@ -697,15 +608,6 @@ for libdir in lib lib64; do
     fi
 done
 
-# Mesa KMS mode: we do NOT need HWComposer/hwservicemanager for graphics.
-# droid-hal-init still runs for audio, sensors, GPS, etc.
-# Ensure DRI driver filenames match what Mesa loader expects.
-for dri in msm_drm swrast kms_swrast; do
-    target="/usr/lib64/dri/${dri}_dri.so"
-    [ -e "$target" ] || ln -sf /usr/lib64/dri/msm_dri.so "$target"
-done
-log "Mesa DRI symlinks: $(ls /usr/lib64/dri/*_dri.so 2>/dev/null | wc -l) drivers"
-
 # KGSL loads a630_sqe.fw + a630_gmu.bin via request_firmware() when the GPU
 # powers on. systemd-udev searches /lib/firmware/ — symlink from /vendor/firmware/.
 mkdir -p /lib/firmware
@@ -722,12 +624,6 @@ log "GPU firmware: $(ls /lib/firmware/a630* 2>/dev/null | wc -l) a630 files link
 # /lib/firmware/tas2557_uCDSP.bin (droid-configs sparse tree), which the kernel's direct
 # loader finds on the SailfishOS udev re-trigger regardless of /vendor mount timing (TRD-017).
 
-# lipstick setgid removal is handled by systemd ExecStartPre=+/bin/chmod g-s
-# in lipstick.service.d/99-mesa-kms.conf. That drop-in runs as root inside the
-# SailfishOS namespace, which is reliable. This is a belt-and-suspenders fallback
-# that also logs the result unconditionally for diagnosis.
-CHMOD_OUT=$(chmod g-s /usr/bin/lipstick 2>&1); CHMOD_RC=$?
-log "lipstick setgid: chmod exit=$CHMOD_RC${CHMOD_OUT:+ err: $CHMOD_OUT} perms=$(ls -la /usr/bin/lipstick 2>/dev/null | cut -c1-10 || echo 'not found')"
 # Ensure qcrild runtime environment exists before droid-hal-init triggers it.
 # init.qcom.rc's post-fs-data block creates these, but in the hybris namespace
 # it may run too late (or not at all), causing qcrild to exit status 1.
@@ -815,19 +711,36 @@ if [ ! -e /dev/device-mapper ]; then
     fi
 fi
 
-log "Starting droid-hal-init (Mesa KMS mode — no HWC2 required)..."
+# droid-hal-init (or the Android 15 base used here) does not set
+# ro.property_service.version before clients connect. Without it, libhybris
+# setprop falls back to the old protocol and fails to set droid.late_start.
+# Inject the property into /system/build.prop so droid-hal-init loads it
+# during PropertyLoadBootDefaults (before any setprop client runs).
+patch_build_prop_property_version() {
+    local orig=/system/build.prop
+    [ -f "$orig" ] || return 0
+    if grep -q '^ro.property_service.version=' "$orig" 2>/dev/null; then
+        log "$orig: ro.property_service.version already present"
+        return 0
+    fi
+    local tmp
+    tmp=$(mktemp -t build.prop.XXXXXX) || return 1
+    cat "$orig" > "$tmp"
+    printf '%s\n' 'ro.property_service.version=2' >> "$tmp"
+    mount --bind "$tmp" "$orig" \
+        && log "Patched $orig: added ro.property_service.version=2" \
+        || log "WARN: failed to bind-mount $orig patch"
+}
+patch_build_prop_property_version
+
+log "Starting droid-hal-init (HWComposer mode)..."
 # Run droid-hal-init in the same mount namespace as this service. APEX mounts
 # made by apexd will then be visible to the startup script, allowing setprop,
 # logcat and other dynamically-linked Android tools to resolve the runtime APEX.
 
-# Checkpoint 2: last sanity check before handing off to Android init.
-ensure_permissive "pre-droid-hal-init"
 /sbin/droid-hal-init >> $LOGF 2>&1 &
 INIT_PID=$!
 log "droid-hal-init PID=$INIT_PID"
-
-# Checkpoint 3: catch resets during first-stage -> selinux_setup -> second_stage.
-ensure_permissive "post-droid-hal-init-start"
 
 # Notify systemd immediately that droid-hal-init is alive.
 # The script continues polling hwservicemanager/qcrild, but systemd
@@ -885,12 +798,9 @@ fi
 # RilServiceModule_1_4 races qcril_init dispatch.
 sleep 3
 
-# Checkpoint 4: before starting vendor HAL services that crash when enforcing.
-ensure_permissive "pre-hal-services"
-
 # Explicitly start HAL services that were disabled by class_start main removal.
-# Audio, vibrator and radio are in class main/late_start, so they don't auto-start.
-for svc in vendor.qti.vibrator vendor.qcrild; do
+# Audio, vibrator, radio and WiFi/BT are in class main/late_start/hal, so they don't auto-start.
+for svc in vendor.nv_mac vendor.cnss-daemon vendor.qti.vibrator vendor.qcrild; do
     if [ -x /system/bin/setprop ]; then
         /system/bin/setprop ctl.start "$svc" 2>/dev/null && log "Started $svc via setprop"
     elif [ -x /vendor/bin/setprop ]; then
@@ -900,16 +810,15 @@ for svc in vendor.qti.vibrator vendor.qcrild; do
     fi
 done
 
-# Checkpoint 5: after vendor HAL services have been triggered.
-ensure_permissive "post-hal-services"
-
-# Checkpoint 6: start background watchdog to catch later flip-backs.
-poll_permissive &
-PERMISSIVE_POLL_PID=$!
-log "Started SELinux permissive watchdog (PID $PERMISSIVE_POLL_PID)"
-
-# No HWC2 wait needed — Mesa uses DRM/KMS directly.
-log "Mesa KMS: skipping HWC2 service wait"
+# Wait for HWComposer to be available — lipstick needs it for display init.
+log "Waiting for HWComposer service..."
+for i in $(seq 1 20); do
+    if pgrep -f "android.hardware.graphics.composer" >/dev/null 2>&1; then
+        log "HWComposer ready after ${i}s"
+        break
+    fi
+    sleep 1
+done
 
 # Wait for qcrild to start. lshal is blocked by SELinux (service_manager find
 # denied in u:r:init:s0 even with permissive=0), so we detect by process presence.
