@@ -182,10 +182,10 @@ patch_rc_display_hal() {
 }
 
 patch_rc_no_reboot /system/etc/init/vold.rc
-# SailfishOS does not use Android vold; leaving it enabled causes a crash loop
-# on this Android 15 base because /system/bin/vold links a libbinder symbol that
-# is missing after the TRD-018 vendor libbinder bind-mount.
-patch_rc_disable_service /system/etc/init/vold.rc
+# NOTE: patch_rc_disable_service is defined later in this script (after line 362).
+# vold is disabled via disabled_services.rc static override instead (works at init parse time).
+# The patch_rc_disable_service call is intentionally omitted here to avoid calling
+# an undefined function.
 patch_rc_no_reboot /system/etc/init/netbpfload.rc
 patch_rc_init_hybris /system/etc/init/hw/init.rc
 patch_rc_init_hybris /system/etc/init/logd.rc
@@ -733,6 +733,20 @@ patch_build_prop_property_version() {
 }
 patch_build_prop_property_version
 
+# Overlay patched hwcomposer HAL before droid-hal-init brings up the composer
+# service. The fixed binary lives in /mnt/vendor/persist/ (survives reboots;
+# same partition used for linkerconfig backup). The vendor partition is
+# dm-verity protected so a bind-mount is the correct non-destructive overlay.
+HWC_FIXED=/mnt/vendor/persist/hwcomposer.qcom.so
+HWC_VENDOR=/vendor/lib64/hw/hwcomposer.qcom.so
+if [ -f "$HWC_FIXED" ]; then
+    mount --bind "$HWC_FIXED" "$HWC_VENDOR" \
+        && log "hwcomposer: bind-mounted fixed HAL from persist ($(readelf -n "$HWC_VENDOR" 2>/dev/null | grep 'Build ID' | awk '{print $NF}'))" \
+        || log "WARN: hwcomposer bind-mount failed"
+else
+    log "WARN: hwcomposer fixed HAL not found at $HWC_FIXED — using vendor default"
+fi
+
 log "Starting droid-hal-init (HWComposer mode)..."
 # Run droid-hal-init in the same mount namespace as this service. APEX mounts
 # made by apexd will then be visible to the startup script, allowing setprop,
@@ -741,11 +755,6 @@ log "Starting droid-hal-init (HWComposer mode)..."
 /sbin/droid-hal-init >> $LOGF 2>&1 &
 INIT_PID=$!
 log "droid-hal-init PID=$INIT_PID"
-
-# Notify systemd immediately that droid-hal-init is alive.
-# The script continues polling hwservicemanager/qcrild, but systemd
-# must know the service is running so it doesn't hit TimeoutSec.
-systemd-notify --ready 2>/dev/null && log "Sent sd_notify READY (early)"
 
 # Wait for hwservicemanager process to be running before qcrild starts.
 # lshal is unusable here — SELinux denies service_manager find in u:r:init:s0
@@ -810,15 +819,29 @@ for svc in vendor.nv_mac vendor.cnss-daemon vendor.qti.vibrator vendor.qcrild; d
     fi
 done
 
-# Wait for HWComposer to be available — lipstick needs it for display init.
+# Wait for HWComposer to be available before signalling READY.
+# Sending READY only after HWComposer is registered ensures that
+# compositor services (startup wizard, lipstick) which have
+# After=droid-hal.service start AFTER the HIDL service exists.
+# This prevents the Qt hwcomposer plugin from falling back to the
+# passthrough HAL path (which would create a second HWCSession and
+# fight the binderized service for DRM master, causing BAD_DISPLAY).
 log "Waiting for HWComposer service..."
+HWC_READY=0
 for i in $(seq 1 20); do
     if pgrep -f "android.hardware.graphics.composer" >/dev/null 2>&1; then
         log "HWComposer ready after ${i}s"
+        HWC_READY=1
         break
     fi
     sleep 1
 done
+if [ "$HWC_READY" -eq 0 ]; then
+    log "WARNING: HWComposer not detected after 20s — sending READY anyway"
+fi
+# Notify systemd that droid-hal-init and HWComposer are up.
+# TimeoutSec=300 gives us ample headroom; HWComposer typically appears in <15s.
+systemd-notify --ready 2>/dev/null && log "Sent sd_notify READY (after HWComposer)"
 
 # Wait for qcrild to start. lshal is blocked by SELinux (service_manager find
 # denied in u:r:init:s0 even with permissive=0), so we detect by process presence.
