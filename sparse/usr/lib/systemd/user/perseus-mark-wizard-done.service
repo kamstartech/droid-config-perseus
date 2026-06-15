@@ -1,0 +1,18 @@
+[Unit]
+Description=Mark startup wizard complete (perseus hybris port)
+# Wizard checks ConditionPathExists for these markers before starting.
+# On our port the wizard cannot write the usersession marker itself because
+# jolla-devicelock-encsfa (which the wizard calls during setup) requires
+# /dev/sailfish/home (LUKS encrypted partition) which does not exist here.
+# Creating the markers here prevents the wizard from running on every boot
+# and holding the MCE tklock notification (which blocks swipe-to-unlock).
+DefaultDependencies=no
+Before=jolla-startupwizard.service jolla-startupwizard-pre-user-session.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'mkdir -p %h/.config && touch %h/.jolla-startupwizard-done %h/.jolla-startupwizard-usersession-done %h/.config/jolla-startupwizard-done %h/.config/jolla-startupwizard-usersession-done'
+
+[Install]
+WantedBy=user-session.target
