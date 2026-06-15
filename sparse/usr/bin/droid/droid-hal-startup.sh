@@ -733,20 +733,6 @@ patch_build_prop_property_version() {
 }
 patch_build_prop_property_version
 
-# Overlay patched hwcomposer HAL before droid-hal-init brings up the composer
-# service. The fixed binary lives in /mnt/vendor/persist/ (survives reboots;
-# same partition used for linkerconfig backup). The vendor partition is
-# dm-verity protected so a bind-mount is the correct non-destructive overlay.
-HWC_FIXED=/mnt/vendor/persist/hwcomposer.qcom.so
-HWC_VENDOR=/vendor/lib64/hw/hwcomposer.qcom.so
-if [ -f "$HWC_FIXED" ]; then
-    mount --bind "$HWC_FIXED" "$HWC_VENDOR" \
-        && log "hwcomposer: bind-mounted fixed HAL from persist ($(readelf -n "$HWC_VENDOR" 2>/dev/null | grep 'Build ID' | awk '{print $NF}'))" \
-        || log "WARN: hwcomposer bind-mount failed"
-else
-    log "WARN: hwcomposer fixed HAL not found at $HWC_FIXED — using vendor default"
-fi
-
 log "Starting droid-hal-init (HWComposer mode)..."
 # Run droid-hal-init in the same mount namespace as this service. APEX mounts
 # made by apexd will then be visible to the startup script, allowing setprop,
