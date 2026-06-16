@@ -795,7 +795,7 @@ sleep 3
 
 # Explicitly start HAL services that were disabled by class_start main removal.
 # Audio, vibrator, radio and WiFi/BT are in class main/late_start/hal, so they don't auto-start.
-for svc in vendor.nv_mac vendor.cnss-daemon vendor.qti.vibrator vendor.qcrild; do
+for svc in vendor.nv_mac vendor.cnss-daemon vendor.qti.vibrator vendor.qcrild vendor.qcrild2; do
     if [ -x /system/bin/setprop ]; then
         /system/bin/setprop ctl.start "$svc" 2>/dev/null && log "Started $svc via setprop"
     elif [ -x /vendor/bin/setprop ]; then
