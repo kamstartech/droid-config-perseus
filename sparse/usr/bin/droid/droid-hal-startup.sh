@@ -9,6 +9,13 @@ echo 0 > /proc/sys/kernel/printk_ratelimit_burst 2>/dev/null
 echo on > /proc/sys/kernel/printk_devkmsg 2>/dev/null && log "devkmsg unlimited"
 echo 7 > /proc/sys/kernel/printk 2>/dev/null && log "printk level set to 7 (debug)"
 
+# Android mounts /proc with hidepid=2,gid=3009 (readproc) for app isolation.
+# SailfishOS relies on reading /proc/<pid>/status freely (libdbusaccess, ps, etc.),
+# and Sailjail handles app sandboxing instead. Undo the Android restriction now,
+# before any user-session services start.
+mount -o remount,hidepid=0 /proc 2>/dev/null && log "Remounted /proc without hidepid" \
+    || log "WARN: failed to remount /proc without hidepid"
+
 # droid-mount-setup.service mounts /dev tmpfs before this service starts.
 # We only need to ensure /dev/socket exists, then add hardware-specific nodes.
 mkdir -p /dev/socket
@@ -375,20 +382,10 @@ patch_rc_disable_service /system/etc/init/keystore2.rc
 patch_rc_disable_service /vendor/etc/init/android.hardware.wifi-service.rc
 patch_rc_disable_service /vendor/etc/init/vendor.qti.hardware.capabilityconfigstore@1.0-service.rc
 
-# TRD-018 (TEMPORARY — disabled to silence the libbinder SYST/VNDR mix; proper fix TBD).
-# These two vendor HALs are version-mismatched and each map BOTH /system and /vendor
-# libbinder.so → "Parcel: Expecting header VNDR but found SYST. Mixing copies of
-# libbinder?" (~51×/boot, to kmsg). Confirmed via sfos-diag TRD-018 precise check 2026-06-12:
-#   - android.hardware.camera.provider@2.4-service : 32-bit (Android 35) — 32-bit libbinder split
-#   - vendor.display.color@1.0-service             : 64-bit but Android-30 vintage (libhidltransport)
-# Neither is used by SailfishOS today (HWComposer drives display; the QTI color HAL is unused).
-# ---- WHEN FIXING LATER ----
-# * display.color@1.0 is safe to leave disabled (SFOS has no consumer).
-# * camera.provider@2.4 is the SFOS camera HAL (jolla-camera→gst-droid→droidmedia talk to it
-#   directly; this is SEPARATE from the disabled libhybris camera compat layer). RE-ENABLE this
-#   line before any camera bring-up, and instead fix the 32-bit libbinder resolution (or use a
-#   64-bit camera provider if one exists for perseus).
-patch_rc_disable_service /vendor/etc/init/android.hardware.camera.provider@2.4-service.rc
+# vendor.display.color@1.0-service: 64-bit Android-30 vintage (libhidltransport), no SFOS consumer.
+# camera.provider@2.4-service: re-enabled for camera bring-up (2026-06-16).
+# The old SYST/VNDR libbinder mix concern (TRD-018) no longer applies now that linkerconfig
+# is fully restored from persist and the vendor namespace resolves cleanly.
 patch_rc_disable_service /vendor/etc/init/vendor.display.color@1.0-service.rc
 
 # Clean up stale init state

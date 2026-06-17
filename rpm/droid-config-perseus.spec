@@ -16,6 +16,16 @@
 # Mi Mix 3: 403 PPI / 245 PPI ≈ 1.64 → nearest 0.25 increment = 1.5
 %define pixel_ratio 1.5
 
+# Install device-specific config overrides after the package transaction.
+# These files are shipped in /usr/share/droid-config-perseus/ to avoid RPM
+# conflicts with upstream packages (ofono-configs-binder, wpa_supplicant).
+%define additional_post_scripts \
+mkdir -p /etc/ofono /etc/wpa_supplicant \
+cp -f /usr/share/droid-config-perseus/binder.conf /etc/ofono/binder.conf \
+cp -f /usr/share/droid-config-perseus/wpa_supplicant.conf /etc/wpa_supplicant/wpa_supplicant.conf \
+/usr/bin/groupadd-user sailfish-radio || : \
+%{nil}
+
 %include droid-configs-device/droid-configs.inc
 %include patterns/patterns-sailfish-device-adaptation-perseus.inc
 %include patterns/patterns-sailfish-device-configuration-perseus.inc
