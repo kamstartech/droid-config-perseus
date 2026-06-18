@@ -1,0 +1,6 @@
+# Perseus (SDM845) droid-card configuration
+# voice_vsid=297816064 = 0x11C05000 = VOICEMMODE1_VSID
+# Required for QCOM SDM845: adev_set_mode(AUDIO_MODE_IN_CALL) alone does not
+# start the voice path in the CAF HAL. A vsid+call_state set_parameters call
+# is needed to trigger voice_start_usecase() for USECASE_VOICEMMODE1_CALL.
+load-module module-droid-card rate=48000 voice_vsid=297816064
