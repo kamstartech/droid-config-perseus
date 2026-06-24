@@ -792,17 +792,22 @@ for _i in $(seq 1 30); do
 done
 [ "$_lc_detected" -eq 0 ] && log "WARN: /linkerconfig tmpfs not seen after 30s — proceeding"
 
-# Re-mount the bootstrap config (patched in early-init) over the init-generated one.
-# /linkerconfig/bootstrap is still reachable directly even though /linkerconfig is now
-# a fresh tmpfs — the linkerconfig.mount bind of bootstrap over /linkerconfig was buried,
-# not destroyed.
-mount --bind /linkerconfig/bootstrap/ld.config.txt "$LIVE_LDCFG" \
-    && log "linkerconfig: re-mounted patched bootstrap ($(wc -l < /linkerconfig/bootstrap/ld.config.txt) lines)" \
-    || log "WARN: failed to re-mount bootstrap linkerconfig — vendor HALs may fail"
+# Re-mount the patched linkerconfig saved in /run/ by early-init.
+# /linkerconfig/bootstrap/ is inside /linkerconfig — SetupMountNamespaces buries it
+# along with everything else under /linkerconfig. /run/ is a separate tmpfs, unaffected.
+mount --bind /run/droid-linkerconfig.txt "$LIVE_LDCFG" \
+    && log "linkerconfig: re-mounted from /run/ ($(wc -l < /run/droid-linkerconfig.txt) lines)" \
+    || log "WARN: failed to re-mount linkerconfig from /run/ — vendor HALs may fail"
 
-# Wait for vendor RC files to be parsed before starting HAL services.
-# Android init sets init.svc.<name> = "stopped" the moment it parses a service entry.
-# Waiting for vendor.qcrild to appear means all vendor RC files up to qcrild.rc are done.
+# Wait for Android property service, then for vendor RC files to be parsed.
+# SetupMountNamespaces fires BEFORE RC parsing in Android 15 init's sequence.
+# We must wait for property_service to come up before getprop is meaningful,
+# then wait for init to set init.svc.vendor.qcrild (set on RC parse, before start).
+log "Waiting for property service socket..."
+for _i in $(seq 1 15); do
+    [ -e /dev/socket/property_service ] && { log "property_service up after ${_i}s"; break; }
+    sleep 1
+done
 log "Waiting for vendor RC parsing (init.svc.vendor.qcrild)..."
 for _i in $(seq 1 30); do
     _svc=$(getprop init.svc.vendor.qcrild 2>/dev/null)

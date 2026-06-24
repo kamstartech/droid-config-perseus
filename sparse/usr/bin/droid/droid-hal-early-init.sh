@@ -233,7 +233,12 @@ if [ -f "$PERSIST_LDCFG" ] && [ "$(stat -c %s "$PERSIST_LDCFG" 2>/dev/null || ec
       }
     ' "$PERSIST_LDCFG" > /linkerconfig/ld.config.txt \
         && log "linkerconfig: patched $(wc -l < /linkerconfig/ld.config.txt) lines into bootstrap" \
-        || { log "WARN: linkerconfig awk patch failed — copying unpatch persist"; cp -f "$PERSIST_LDCFG" /linkerconfig/ld.config.txt; }
+        || { log "WARN: linkerconfig awk patch failed — copying unpatched persist"; cp -f "$PERSIST_LDCFG" /linkerconfig/ld.config.txt; }
+    # Also save to /run/ so startup.sh can re-mount it after SetupMountNamespaces buries
+    # /linkerconfig/bootstrap (bootstrap/ is inside /linkerconfig — the new tmpfs hides it).
+    cp -f /linkerconfig/ld.config.txt /run/droid-linkerconfig.txt \
+        && log "linkerconfig: saved patched copy to /run/droid-linkerconfig.txt" \
+        || log "WARN: failed to save linkerconfig to /run"
 elif [ -f /linkerconfig/ld.config.txt ] && [ "$(stat -c %s /linkerconfig/ld.config.txt 2>/dev/null || echo 0)" -ge 100000 ]; then
     log "Using existing full linkerconfig (no persist copy available)"
 else
