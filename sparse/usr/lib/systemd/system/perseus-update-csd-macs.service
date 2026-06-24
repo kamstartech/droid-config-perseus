@@ -1,0 +1,12 @@
+[Unit]
+Description=Capture WiFi/BT MACs for CSD
+After=network.target bluetooth.service
+Wants=network.target bluetooth.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/droid/perseus-update-csd-macs.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

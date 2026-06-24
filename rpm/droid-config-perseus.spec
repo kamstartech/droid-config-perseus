@@ -23,7 +23,6 @@
 mkdir -p /etc/ofono /etc/wpa_supplicant \
 cp -f /usr/share/droid-config-perseus/binder.conf /etc/ofono/binder.conf \
 cp -f /usr/share/droid-config-perseus/wpa_supplicant.conf /etc/wpa_supplicant/wpa_supplicant.conf \
-/usr/bin/groupadd-user sailfish-radio || : \
 %{nil}
 
 %include droid-configs-device/droid-configs.inc

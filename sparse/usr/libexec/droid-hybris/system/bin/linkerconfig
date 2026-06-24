@@ -1,0 +1,45 @@
+#!/bin/sh
+# linkerconfig stub for SailfishOS hybris
+#
+# Android 15 init calls linkerconfig during perform_apex_config to regenerate
+# /linkerconfig/ld.config.txt from the set of currently mounted APEX modules.
+# In our hybris environment the full config was generated during an Android boot
+# and saved to /mnt/vendor/persist/ld.config.txt. We restore it here so init's
+# action succeeds without needing the real linkerconfig binary or a fully
+# populated APEX set.
+#
+# Usage: linkerconfig [--target <dir>]
+
+TARGET=/linkerconfig
+PERSIST=/mnt/vendor/persist/ld.config.txt
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --target)
+            [ -n "$2" ] && TARGET="$2"
+            shift 2
+            ;;
+        --target=*)
+            TARGET="${1#--target=}"
+            shift
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+mkdir -p "$TARGET" "$TARGET/default" 2>/dev/null || true
+
+size=0
+[ -f "$PERSIST" ] && size="$(stat -c %s "$PERSIST" 2>/dev/null || echo 0)"
+
+if [ "$size" -ge 100000 ]; then
+    cp -f "$PERSIST" "$TARGET/ld.config.txt" 2>/dev/null || true
+    cp -f "$PERSIST" "$TARGET/default/ld.config.txt" 2>/dev/null || true
+    echo "hybris-linkerconfig: restored $TARGET from persist (${size} bytes)" > /dev/kmsg 2>/dev/null
+else
+    echo "hybris-linkerconfig: WARN persist config missing or too small ($size bytes)" > /dev/kmsg 2>/dev/null
+fi
+
+exit 0

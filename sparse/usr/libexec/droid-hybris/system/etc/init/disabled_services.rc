@@ -10,9 +10,8 @@ service audioserver /system/bin/audioserver_HYBRIS_DISABLED
     override
     disabled
 
-service logd /system/bin/logd_HYBRIS_DISABLED
-    override
-    disabled
+# logd enabled so Android logcat works for HWC/composer debugging.
+# Re-disable once display bring-up is complete.
 
 service netd /system/bin/netd_HYBRIS_DISABLED
     override
@@ -51,5 +50,11 @@ service mediametrics /system/bin/mediametrics_HYBRIS_DISABLED
     disabled
 
 service bpfloader /system/bin/netbpfload_HYBRIS_DISABLED
+    override
+    disabled
+
+# vold crashes on Android 15 (checkCallingPermission removed from libbinder).
+# SailfishOS manages its own storage — vold is not needed.
+service vold /system/bin/vold_HYBRIS_DISABLED
     override
     disabled

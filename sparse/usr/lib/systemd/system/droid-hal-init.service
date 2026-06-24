@@ -1,7 +1,7 @@
 [Unit]
 Description=droid-hal-init
 Wants=systemd-udev-settle.service
-After=local-fs.target systemd-udev-settle.service systemd-tmpfiles-setup.service droid-hal-prepare.service
+After=local-fs.target systemd-modules-load.service systemd-udev-settle.service systemd-tmpfiles-setup.service droid-hal-prepare.service
 Requires=droid-hal-prepare.service
 Before=basic.target network.target bluetooth.service ofono.service sensorfwd.service
 DefaultDependencies=no
@@ -19,8 +19,9 @@ NotifyAccess=all
 ExecStart=/bin/sh /usr/bin/droid/droid-hal-startup.sh
 ExecStop=/bin/sh /usr/bin/droid/droid-hal-shutdown.sh
 Restart=always
-# Lets make sure we don't block minutes in case of errors.
-TimeoutSec=90
+# vendor.adsprpcd starts at t~30s, adsprpc-smd opens at t~32s, APR UP at t~92s.
+# startup.sh sends READY at ~t=105s (adsprpc + 70s). 180s gives 75s safety margin.
+TimeoutSec=180
 StartLimitInterval=60
 StartLimitBurst=2
 

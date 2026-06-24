@@ -1,0 +1,19 @@
+<driconf>
+  <!-- Force Mesa to load the Zink OpenGL-on-Vulkan driver for Adreno/msm.
+       This is needed because the native Gallium msm driver on SDM845 with
+       KGSL-only GPU cannot expose EGL_WL_bind_wayland_display, which
+       lipstick requires to bind Wayland display and present the UI.
+
+       Using /etc/drirc avoids a setuid/setgid wrapper around lipstick;
+       Mesa reads drirc before the __normal_user() guard that ignores
+       environment variables for privileged processes.
+
+       TODO: narrow this to lipstick/startup-wizard once other apps are
+       confirmed to work with the native msm driver.
+  -->
+  <device driver="msm">
+    <application name="Default">
+      <option name="dri_driver" value="zink" />
+    </application>
+  </device>
+</driconf>

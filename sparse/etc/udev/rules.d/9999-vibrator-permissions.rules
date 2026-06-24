@@ -1,0 +1,8 @@
+# Perseus / Xiaomi Mi Mix 3: qpnp-haptics exposes vibrator via LED class.
+# NGFD's droid-vibrator plugin runs as defaultuser and needs write access.
+# Runs after 998-droid-system.rules (which sets 0664 system:input) due to
+# higher prefix. Uses %p (udev device path) to reach sysfs attribute files.
+# NOTE: Android ueventd (droid-hal-init) resets these to 0664 system:system
+# after this rule fires. droid-hal-startup.sh chmod is the authoritative fix.
+SUBSYSTEM=="leds", KERNEL=="vibrator", ACTION=="add|change", \
+    RUN+="/bin/chmod 0666 /sys%p/activate /sys%p/duration /sys%p/state /sys%p/brightness"

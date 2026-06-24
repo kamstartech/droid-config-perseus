@@ -1,0 +1,12 @@
+[Unit]
+Description=Force RNDIS USB developer mode (gsi.rndis), independent of usb-moded cable detection
+After=usb-moded.service droid-hal-init.service
+Wants=droid-hal-init.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/droid/usb-rndis-up.sh
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,10 @@
+[Unit]
+Description=One-shot post-boot diagnostic collector for open TRD issues (temporary)
+After=lipstick.service droid-hal.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/droid/sfos-diag.sh
+
+[Install]
+WantedBy=multi-user.target

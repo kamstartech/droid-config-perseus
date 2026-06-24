@@ -1,0 +1,12 @@
+[Unit]
+Description=Unload module-suspend-on-idle from PulseAudio (keeps droid PCM open)
+After=pulseaudio.service
+BindsTo=pulseaudio.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/pactl unload-module module-suspend-on-idle
+
+[Install]
+WantedBy=user-session.target

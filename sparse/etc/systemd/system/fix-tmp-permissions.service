@@ -1,0 +1,13 @@
+[Unit]
+Description=Fix /tmp permissions for SailfishOS apps (Perseus)
+DefaultDependencies=no
+After=tmp.mount
+
+[Service]
+Type=oneshot
+ExecStart=/bin/chmod 1777 /tmp
+ExecStart=/bin/chown root:root /tmp
+RemainAfterExit=yes
+
+[Install]
+WantedBy=local-fs.target
