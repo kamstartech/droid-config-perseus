@@ -204,23 +204,98 @@ patch_rc_display_hal /vendor/etc/init/vendor.display.color@1.0-service.rc
 patch_rc_display_hal /system/etc/init/surfaceflinger.rc
 patch_rc_display_hal /vendor/etc/init/android.hardware.sensors@1.0-service.rc
 
-# Audio HAL service: remove task_profiles and audioserver onrestart, and mark disabled.
-# vendor.audio-hal is in class hal — class_start hal fires it even though we remove
-# class_start main/late_start. Injecting 'disabled' prevents auto-start via any trigger.
-# pulseaudio-modules-droid uses libhardware directly and does NOT need this HIDL service.
+# Audio HAL service handling.
+#
+# Primary mode (current): the 64-bit HIDL compat wrapper binds over
+# /vendor/lib64/hw/audio.primary.sdm845.so and forwards PulseAudio's calls to
+# the 32-bit vendor.audio-hal service. The 32-bit vendor blob then drives the
+# audio hardware with the ADM topologies the sdm845 DSP accepts.
+#
+# Fallback mode: if no wrapper is present, vendor.audio-hal stays disabled and
+# PulseAudio loads the 64-bit CAF HAL directly. That path sends unsupported
+# ADM commands (ADSP_EUNSUPPORTED), so the wrapper is required for working
+# audio.
+AUDIO_HIDL_COMPAT_WRAPPER_DROIDHYBRIS=/usr/libexec/droid-hybris/system/lib64/hw/audio.hidl_compat.default.so
+AUDIO_HIDL_COMPAT_WRAPPER_VENDOR=/usr/libexec/droid-hybris/vendor/lib64/hw/audio.hidl_compat.default.so
+AUDIO_HIDL_COMPAT_WRAPPER_SYSTEM=/system/lib64/hw/audio.hidl_compat.default.so
+AUDIO_HIDL_COMPAT_WRAPPER=""
+AUDIO_PRIMARY_64=/vendor/lib64/hw/audio.primary.sdm845.so
+
+if [ -f "$AUDIO_HIDL_COMPAT_WRAPPER_DROIDHYBRIS" ]; then
+    AUDIO_HIDL_COMPAT_WRAPPER="$AUDIO_HIDL_COMPAT_WRAPPER_DROIDHYBRIS"
+elif [ -f "$AUDIO_HIDL_COMPAT_WRAPPER_VENDOR" ]; then
+    AUDIO_HIDL_COMPAT_WRAPPER="$AUDIO_HIDL_COMPAT_WRAPPER_VENDOR"
+elif [ -f "$AUDIO_HIDL_COMPAT_WRAPPER_SYSTEM" ]; then
+    AUDIO_HIDL_COMPAT_WRAPPER="$AUDIO_HIDL_COMPAT_WRAPPER_SYSTEM"
+fi
+
 patch_rc_audio_hal() {
     local orig="$1"
     [ -f "$orig" ] || return 0
     local tmp
     tmp=$(mktemp -t hybris-rc.XXXXXX) || return 1
-    sed -e '/task_profiles/d' \
-        -e '/onrestart restart audioserver/d' \
-        -e '/^service vendor\.audio-hal /a\    override\n    disabled' \
-        "$orig" > "$tmp"
-    mount --bind "$tmp" "$orig" && log "Patched audio HAL $(basename $orig): hybris fixes (disabled)" \
-        || log "WARN: failed to bind-mount audio HAL patch for $orig"
+    if [ -f "$AUDIO_HIDL_COMPAT_WRAPPER" ]; then
+        # Keep vendor.audio-hal enabled (do not inject 'disabled').
+        # Remove task_profiles/audioserver onrestart lines that reference
+        # services we do not run in SailfishOS.
+        sed -e '/task_profiles/d' \
+            -e '/onrestart restart audioserver/d' \
+            "$orig" > "$tmp"
+        mount --bind "$tmp" "$orig" && log "Patched audio HAL $(basename $orig): hidl_compat wrapper mode (enabled)" \
+            || log "WARN: failed to bind-mount audio HAL patch for $orig"
+    else
+        # Legacy direct-HAL mode: vendor.audio-hal must stay disabled.
+        sed -e '/task_profiles/d' \
+            -e '/onrestart restart audioserver/d' \
+            -e '/^service vendor\.audio-hal /a\    override\n    disabled' \
+            "$orig" > "$tmp"
+        mount --bind "$tmp" "$orig" && log "Patched audio HAL $(basename $orig): direct 64-bit CAF HAL mode (vendor.audio-hal disabled)" \
+            || log "WARN: failed to bind-mount audio HAL patch for $orig"
+    fi
 }
 patch_rc_audio_hal /vendor/etc/init/android.hardware.audio.service.rc
+
+# Null-mount sound_trigger.primary.sdm845.so so the audio HAL's sound trigger
+# extension (audio_extn_sound_trigger) cannot load it. Without this, the SVA
+# Sound Trigger HAL initializes a session and registers a callback with the
+# audio HAL. When vendor.audio-hal's WriteThread calls start_output_stream →
+# enable_audio_route, the callback fires on a destroyed mutex → SIGABRT.
+# The SoundTriggerHw service doesn't run in SailfishOS so the session is never
+# properly torn down. Nulling the library keeps st_dev=NULL so the callback
+# path is skipped entirely.
+SOUND_TRIGGER_HAL=/vendor/lib/hw/sound_trigger.primary.sdm845.so
+if [ -f "$SOUND_TRIGGER_HAL" ]; then
+    mount --bind /dev/null "$SOUND_TRIGGER_HAL" \
+        && log "Null-mounted $SOUND_TRIGGER_HAL (prevents SVA mutex crash)" \
+        || log "WARN: failed to null-mount sound trigger HAL"
+fi
+
+# Bind-mount the 64-bit HIDL compat wrapper over the broken 64-bit CAF HAL.
+# This must happen before droid-hal-init starts class hal (and thus
+# vendor.audio-hal) and before PulseAudio opens the audio device.
+if [ -f "$AUDIO_HIDL_COMPAT_WRAPPER" ] && [ -f "$AUDIO_PRIMARY_64" ]; then
+    mount --bind "$AUDIO_HIDL_COMPAT_WRAPPER" "$AUDIO_PRIMARY_64" \
+        && log "Bind-mounted audio.hidl_compat.default -> $AUDIO_PRIMARY_64" \
+        || log "WARN: failed to bind-mount audio HIDL compat wrapper"
+
+    # The wrapper links libaudiohal@6.0.so (a system library) but runs in the
+    # vendor/sphal namespace. Patch the linker config so sphal can search
+    # /system/lib64 for the wrapper's dependencies.
+    if [ -f /linkerconfig/ld.config.txt ]; then
+        tmp=$(mktemp -t ld-config.XXXXXX) || true
+        if [ -n "$tmp" ]; then
+            if ! grep -q '^namespace.sphal.search.paths += /system/${LIB}$' /linkerconfig/ld.config.txt 2>/dev/null; then
+                sed -e '/^namespace.sphal.search.paths = /a\namespace.sphal.search.paths += /system/${LIB}' \
+                    /linkerconfig/ld.config.txt > "$tmp" \
+                    && mount --bind "$tmp" /linkerconfig/ld.config.txt \
+                    && log "Patched linkerconfig: sphal can search /system/lib64" \
+                    || log "WARN: failed to patch linkerconfig"
+            else
+                rm -f "$tmp"
+            fi
+        fi
+    fi
+fi
 
 # Patch audio policy config: add AUDIO_FORMAT_PCM_16_BIT profiles to primary output
 # and deep_buffer ports so pulseaudio module-droid-card finds a compatible format.
@@ -434,6 +509,41 @@ else
     log "  To fix: boot into Android once to regenerate /linkerconfig, then reboot to SailfishOS"
 fi
 log "linkerconfig: $(wc -c < $LIVE_LDCFG 2>/dev/null || echo '?')b, ${LIB}-capable: $(grep -c '\${LIB}' $LIVE_LDCFG 2>/dev/null || echo 0) paths"
+
+# droid-hybris binaries (minimediaservice etc.) live outside Android's dir. mappings.
+# Without a matching dir.system entry the linker assigns them a minimal namespace
+# that lacks APEX links (libandroidicu.so from com.android.i18n is unreachable).
+# Prepend the path so they get the full [system] namespace on every boot.
+_lc_needs_direntry=false
+_lc_needs_searchpath=false
+grep -qF 'dir.system = /usr/libexec/droid-hybris/' $LIVE_LDCFG 2>/dev/null || _lc_needs_direntry=true
+grep -qF '/usr/libexec/droid-hybris/system/${LIB}' $LIVE_LDCFG 2>/dev/null || _lc_needs_searchpath=true
+if $_lc_needs_direntry || $_lc_needs_searchpath; then
+    tmp=$(mktemp -t ld-droidhybris.XXXXXX) || true
+    if [ -n "$tmp" ]; then
+        # Prepend dir.system so droid-hybris binaries get the full [system] namespace
+        # (APEX links, libandroidicu.so etc.). Also add the droid-hybris lib path to
+        # namespace.default.search.paths so new libraries deployed there (e.g.
+        # libdroidmedia_binder_compat.so) are found without a system image rebuild.
+        # Both patches are idempotent — skip whichever is already present.
+        _lc_input=$LIVE_LDCFG
+        if $_lc_needs_direntry; then
+            { printf 'dir.system = /usr/libexec/droid-hybris/\n'; cat $_lc_input; } > "$tmp"
+            _lc_input=$tmp
+        fi
+        if $_lc_needs_searchpath; then
+            # BusyBox sed lacks '0,/pattern/' (GNU-only). Use awk to insert after first match.
+            _ln=$(grep -n '^namespace\.default\.search\.paths = /system/\${LIB}$' $_lc_input | head -1 | cut -d: -f1)
+            if [ -n "$_ln" ]; then
+                awk -v ln="$_ln" 'NR==ln{print; print "namespace.default.search.paths += /usr/libexec/droid-hybris/system/${LIB}"; next} {print}' \
+                    $_lc_input > "${tmp}.2" && mv "${tmp}.2" "$tmp"
+            fi
+        fi
+        mount --bind "$tmp" $LIVE_LDCFG \
+            && log "Patched linkerconfig: dir.system=$(! $_lc_needs_direntry && echo already || echo added) search_path=$(! $_lc_needs_searchpath && echo already || echo added)" \
+            || log "WARN: failed to patch linkerconfig for droid-hybris"
+    fi
+fi
 
 # qcrild/vendor-HAL fix: the persisted Android linkerconfig isolates the [vendor]
 # namespace from /system (permitted.paths lacks /system). But vendor binaries
@@ -790,9 +900,30 @@ fi
 # RilServiceModule_1_4 races qcril_init dispatch.
 sleep 3
 
+# Re-apply linkerconfig search path patch after droid-hal-init's SetupMountNamespaces.
+# init mounts a fresh tmpfs on /linkerconfig during startup, burying the earlier bind-mount.
+# Re-patching here ensures minimediaservice (and other droid-hybris binaries started below)
+# can find libdroidmedia_binder_compat.so in /usr/libexec/droid-hybris/system/lib64.
+if ! grep -qF '/usr/libexec/droid-hybris/system/${LIB}' $LIVE_LDCFG 2>/dev/null; then
+    _ln2=$(grep -n '^namespace\.default\.search\.paths = /system/\${LIB}$' $LIVE_LDCFG | head -1 | cut -d: -f1)
+    if [ -n "$_ln2" ]; then
+        _tmp2=$(mktemp -t ld-droidhybris2.XXXXXX) || true
+        if [ -n "$_tmp2" ]; then
+            awk -v ln="$_ln2" 'NR==ln{print; print "namespace.default.search.paths += /usr/libexec/droid-hybris/system/${LIB}"; next} {print}' \
+                $LIVE_LDCFG > "${_tmp2}.2" && mv "${_tmp2}.2" "$_tmp2" \
+                && mount --bind "$_tmp2" $LIVE_LDCFG \
+                && log "Re-patched linkerconfig search_path after init SetupMountNamespaces" \
+                || log "WARN: failed to re-patch linkerconfig search_path"
+        fi
+    fi
+else
+    log "linkerconfig search_path already present after init (no re-patch needed)"
+fi
+
 # Explicitly start HAL services that were disabled by class_start main removal.
 # Audio, vibrator, radio and WiFi/BT are in class main/late_start/hal, so they don't auto-start.
-for svc in vendor.nv_mac vendor.cnss-daemon vendor.qti.vibrator vendor.qcrild vendor.qcrild2; do
+# minimedia (class main) registers media.audio_policy and media.camera.
+for svc in vendor.nv_mac vendor.cnss-daemon vendor.qti.vibrator vendor.qcrild vendor.qcrild2 vendor.adsprpcd minimedia; do
     if [ -x /system/bin/setprop ]; then
         /system/bin/setprop ctl.start "$svc" 2>/dev/null && log "Started $svc via setprop"
     elif [ -x /vendor/bin/setprop ]; then
@@ -822,9 +953,45 @@ done
 if [ "$HWC_READY" -eq 0 ]; then
     log "WARNING: HWComposer not detected after 20s — sending READY anyway"
 fi
-# Notify systemd that droid-hal-init and HWComposer are up.
-# TimeoutSec=300 gives us ample headroom; HWComposer typically appears in <15s.
-systemd-notify --ready 2>/dev/null && log "Sent sd_notify READY (after HWComposer)"
+# Fix vibrator sysfs permissions before ngfd starts via defaultuser session.
+# Android ueventd sets /sys/class/leds/vibrator/ to 0664 system:system, which
+# blocks ngfd's droid-vibrator plugin (runs as defaultuser) from writing to
+# duration/activate/state. chmod here runs after ueventd (well within the
+# hwservicemanager wait above) and before systemd-notify sends READY, which
+# is the trigger for the defaultuser session (and ngfd) to start.
+for node in activate duration state brightness; do
+    [ -e "/sys/class/leds/vibrator/$node" ] && \
+        chmod 0666 "/sys/class/leds/vibrator/$node" 2>/dev/null
+done
+log "Vibrator sysfs permissions: $(ls -la /sys/class/leds/vibrator/activate 2>/dev/null | awk '{print $1,$3,$4}' || echo 'node not found')"
+
+# Notify systemd that droid-hal-init and HWComposer are up. ADSP audio is NOT
+# included in the READY gate — PulseAudio is gated separately via a drop-in
+# (50-adsp-wait.conf ExecStartPre) that blocks PA until t=120s when APR is ready.
+# All other services (lipstick, ofono, sensorfwd) start immediately.
+systemd-notify --ready 2>/dev/null && log "Sent sd_notify READY (HWComposer up, PA gated via 50-adsp-wait.conf)"
+
+# TAS2557 SmartPA boot-recovery:
+# PA starts at t=120s; module-droid-card is loaded from droid.pa at PA startup.
+# The first tas2557_enable() fires at t=~121s: firmware not loaded → safe-guard failure
+# → I2C chip restart → firmware reloads → fw_ready power-up with s1_0 config.
+# The chip needs ~14s to settle after GPIO reset. We fire at t=136s (absolute
+# uptime) to do a full PowerCtrl cycle with the correct s3_6 config.
+# PowerCtrl=0 → mbPowerUp=false; Configuration=10 (s3_6); PowerCtrl=1 → full
+# startup+unmute sequence with calibration data loaded. Without this the speaker
+# uses the s1_0 tuning-mode profile which produces no audio output.
+(
+    target=136
+    cur=$(awk '{print int($1)}' /proc/uptime)
+    [ "$cur" -lt "$target" ] && sleep $((target - cur))
+    if [ -x /system/bin/tinymix ]; then
+        /system/bin/tinymix "PowerCtrl" 0 2>/dev/null
+        sleep 0.2
+        /system/bin/tinymix "Configuration" 10 2>/dev/null
+        /system/bin/tinymix "PowerCtrl" 1 2>/dev/null
+        log "SmartPA re-enable via PowerCtrl (s3_6) at uptime=$(awk '{print int($1)}' /proc/uptime)s"
+    fi
+) &
 
 # Wait for qcrild to start. lshal is blocked by SELinux (service_manager find
 # denied in u:r:init:s0 even with permissive=0), so we detect by process presence.

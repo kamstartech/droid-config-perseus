@@ -122,18 +122,21 @@ for d in /sys/block/dm-*; do
     [ -e "/dev/block/mapper/$name" ] || ln -sf "$dev" "/dev/block/mapper/$name"
 done
 
-# Android 15 APEX resolution: bionic libs and linker are symlinks to
-# /apex/com.android.runtime/ which isn't mounted in SFOS. Use tmpfs +
-# copies of bootstrap bionic (not symlinks — q.so resolves realpath and
-# rejects targets outside permitted namespace paths).
+# Android 15 APEX resolution: bionic libs and linker live in
+# /apex/com.android.runtime/ which is mounted by apexd. Use a tmpfs on /apex
+# so apexd can bind-mount the activated APEX modules here.
 if ! mountpoint -q /apex 2>/dev/null; then
-    log "Mounting tmpfs on /apex for Android 15 bionic"
+    log "Mounting tmpfs on /apex for Android 15 APEX"
     mkdir -p /apex
-    mount -t tmpfs -o mode=0755,size=32m tmpfs /apex
+    mount -t tmpfs -o mode=0755,size=64m tmpfs /apex
 fi
 
+# Populate a bootstrap APEX fallback in the service namespace. Android tools
+# such as chcon/setprop/logcat are dynamically linked to /apex/com.android.runtime
+# and must work before apexd runs. apexd will bind-mount the real APEX modules
+# over these directories inside the same namespace once droid-hal-init starts.
 if [ ! -f /apex/com.android.runtime/lib64/bionic/libc.so ]; then
-    log "Populating APEX runtime from bootstrap bionic"
+    log "Populating APEX runtime fallback from bootstrap bionic"
     mkdir -p /apex/com.android.runtime/lib64/bionic
     mkdir -p /apex/com.android.runtime/lib/bionic
     mkdir -p /apex/com.android.runtime/bin
@@ -165,7 +168,7 @@ if [ ! -f /apex/com.android.runtime/lib64/bionic/libc.so ]; then
 
     # ICU (com.android.i18n) — essential for Android 15 HALs
     if [ ! -f /apex/com.android.i18n/lib64/libicuuc.so ]; then
-        log "Populating com.android.i18n APEX"
+        log "Populating com.android.i18n APEX fallback"
         mkdir -p /apex/com.android.i18n/lib64
         mkdir -p /apex/com.android.i18n/lib
         mkdir -p /apex/com.android.i18n/etc
@@ -186,7 +189,7 @@ if [ ! -f /apex/com.android.runtime/lib64/bionic/libc.so ]; then
 
     # Conscrypt (com.android.conscrypt) — essential for secure HAL communication
     if [ ! -f /apex/com.android.conscrypt/lib64/libcrypto.so ]; then
-        log "Populating com.android.conscrypt APEX"
+        log "Populating com.android.conscrypt APEX fallback"
         mkdir -p /apex/com.android.conscrypt/lib64
         mkdir -p /apex/com.android.conscrypt/lib
         for f in libcrypto.so libssl.so; do
@@ -195,14 +198,24 @@ if [ ! -f /apex/com.android.runtime/lib64/bionic/libc.so ]; then
         done
     fi
 
-    log "APEX populated: $(ls /apex/com.android.runtime/lib64/bionic/ 2>/dev/null | wc -w) lib64, $(ls /apex/com.android.runtime/bin/ 2>/dev/null | wc -w) bin"
+    log "APEX fallback populated: $(ls /apex/com.android.runtime/lib64/bionic/ 2>/dev/null | wc -w) lib64, $(ls /apex/com.android.runtime/bin/ 2>/dev/null | wc -w) bin"
 fi
 
-# Linkerconfig: always regenerate to prevent stale configs from rootfs
+# Linkerconfig: use the full Android-generated config saved from a previous
+# Android boot. That config properly isolates vendor/system namespaces and
+# prevents vendor HALs from loading a conflicting /system/lib64/libbinder.so.
+# Only fall back to the minimal config if no persisted full config exists.
 ensure_mp /linkerconfig
-rm -f /linkerconfig/ld.config.txt
-log "Generating linkerconfig for Android 15"
-cat > /linkerconfig/ld.config.txt <<'LDCFG'
+PERSIST_LDCFG=/mnt/vendor/persist/ld.config.txt
+if [ -f "$PERSIST_LDCFG" ] && [ "$(stat -c %s "$PERSIST_LDCFG" 2>/dev/null || echo 0)" -ge 100000 ]; then
+    log "Restoring full linkerconfig from persist ($(stat -c %s "$PERSIST_LDCFG") bytes)"
+    cp -f "$PERSIST_LDCFG" /linkerconfig/ld.config.txt
+elif [ -f /linkerconfig/ld.config.txt ] && [ "$(stat -c %s /linkerconfig/ld.config.txt 2>/dev/null || echo 0)" -ge 100000 ]; then
+    log "Using existing full linkerconfig"
+else
+    rm -f /linkerconfig/ld.config.txt
+    log "Generating minimal linkerconfig fallback for Android 15"
+    cat > /linkerconfig/ld.config.txt <<'LDCFG'
 dir.system = /system/bin
 dir.vendor = /vendor/bin
 
@@ -220,6 +233,7 @@ namespace.default.search.paths = /vendor/lib64:/vendor/lib64/hw:/system/lib64/bo
 namespace.default.permitted.paths = /system:/vendor:/system_ext:/product:/odm:/apex:/data
 namespace.default.asan.search.paths = /vendor/lib64
 LDCFG
-log "Linkerconfig generated"
+fi
+log "Linkerconfig ready: $(wc -c < /linkerconfig/ld.config.txt 2>/dev/null || echo 0) bytes"
 
-log "Done: system=$(mountpoint -q /system && echo ok || echo FAIL) vendor=$(mountpoint -q /vendor && echo ok || echo FAIL) apex=$([ -f /apex/com.android.runtime/lib64/bionic/libc.so ] && echo ok || echo FAIL)"
+log "Done: system=$(mountpoint -q /system && echo ok || echo FAIL) vendor=$(mountpoint -q /vendor && echo ok || echo FAIL) apex_tmpfs=$(mountpoint -q /apex && echo ok || echo FAIL)"
