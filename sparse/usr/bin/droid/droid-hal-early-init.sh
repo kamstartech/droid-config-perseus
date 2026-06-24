@@ -215,21 +215,34 @@ if [ -f "$PERSIST_LDCFG" ] && [ "$(stat -c %s "$PERSIST_LDCFG" 2>/dev/null || ec
     #  3. Add /system/${LIB} search + /system permitted to [vendor] namespace (qcrild, HALs)
     awk '
       BEGIN {
-          print "dir.system = /usr/libexec/droid-hybris/"
+          done_dir = 0
           done_hybris = 0
           invendor = 0
       }
       /^\[/ { invendor = ($0 == "[vendor]") }
+      /^dir\.system = \/usr\/libexec\/droid-hybris\/$/ {
+          # Idempotent: only emit if not already at the top
+          if (!done_dir) { print; done_dir = 1 }
+          next
+      }
+      FNR == 1 && !done_dir {
+          print "dir.system = /usr/libexec/droid-hybris/"
+          done_dir = 1
+      }
       { print }
       !done_hybris && /^namespace\.default\.search\.paths = \/system\/\$\{LIB\}$/ {
           print "namespace.default.search.paths += /usr/libexec/droid-hybris/system/${LIB}"
           done_hybris = 1
       }
-      invendor && /^namespace\.default\.search\.paths \+= \/vendor\/\$\{LIB\}\/egl$/ {
+      invendor && /^namespace\.default\.search\.paths \+= \/vendor\/\$\{LIB\}\/egl$/ &&
+          !done_vendor_search {
           print "namespace.default.search.paths += /system/${LIB}"
+          done_vendor_search = 1
       }
-      invendor && /^namespace\.default\.permitted\.paths \+= \/system\/vendor$/ {
+      invendor && /^namespace\.default\.permitted\.paths \+= \/system\/vendor$/ &&
+          !done_vendor_permit {
           print "namespace.default.permitted.paths += /system"
+          done_vendor_permit = 1
       }
     ' "$PERSIST_LDCFG" > /linkerconfig/ld.config.txt \
         && log "linkerconfig: patched $(wc -l < /linkerconfig/ld.config.txt) lines into bootstrap" \

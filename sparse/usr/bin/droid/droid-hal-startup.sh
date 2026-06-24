@@ -808,15 +808,13 @@ for _i in $(seq 1 15); do
     [ -e /dev/socket/property_service ] && { log "property_service up after ${_i}s"; break; }
     sleep 1
 done
-log "Waiting for vendor RC parsing (init.svc.vendor.qcrild)..."
-for _i in $(seq 1 30); do
-    _svc=$(getprop init.svc.vendor.qcrild 2>/dev/null)
-    if [ -n "$_svc" ]; then
-        log "vendor RC parsed after ${_i}s (init.svc.vendor.qcrild=${_svc})"
-        break
-    fi
-    sleep 1
-done
+# LoadBootScripts (RC parsing) runs immediately after property_init in init's second stage
+# and completes in < 1s. A 2s sleep is sufficient to ensure all vendor service entries are
+# registered before we issue setprop ctl.start. Polling init.svc.vendor.qcrild is
+# unreliable here — the property socket is up before LoadBootScripts finishes, so getprop
+# returns empty and the poll always hits the 30s timeout.
+sleep 2
+log "vendor RC parse window elapsed — proceeding"
 
 # Explicitly start HAL services that were disabled by class_start main removal.
 # Audio, vibrator, radio and WiFi/BT are in class main/late_start/hal, so they don't auto-start.
