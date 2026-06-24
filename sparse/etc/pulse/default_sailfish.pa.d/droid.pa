@@ -1,22 +1,3 @@
-### Load module-droid-card (via arm_droid_card_custom.pa for device-specific args)
-### and module-droid-hidl. PulseAudio startup is gated behind adsp-apr-wait.sh
-### (50-adsp-wait.conf drop-in) so ADSP APR is ready by the time we get here.
-.ifexists /etc/pulse/arm_droid_card_custom.pa
- .include /etc/pulse/arm_droid_card_custom.pa
-.else
- load-module module-droid-card rate=48000
-.endif
-
-### Needed on devices with older Android bases.
-.ifexists module-droid-glue.so
- .nofail
- load-module module-droid-glue
- .fail
-.endif
-
-### Needed on many new devices.
-.ifexists module-droid-hidl.so
- .nofail
- load-module module-droid-hidl
- .fail
-.endif
+### module-droid-card and module-droid-hidl are loaded by droid-card-delayed.service
+### after /proc/asound/card0/cpe0_state reports ONLINE (ADSP APR ready).
+### Loading them here at PA startup risks Q6ASM zombie sessions on slow boots.

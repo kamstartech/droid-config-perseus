@@ -278,23 +278,6 @@ if [ -f "$AUDIO_HIDL_COMPAT_WRAPPER" ] && [ -f "$AUDIO_PRIMARY_64" ]; then
         && log "Bind-mounted audio.hidl_compat.default -> $AUDIO_PRIMARY_64" \
         || log "WARN: failed to bind-mount audio HIDL compat wrapper"
 
-    # The wrapper links libaudiohal@6.0.so (a system library) but runs in the
-    # vendor/sphal namespace. Patch the linker config so sphal can search
-    # /system/lib64 for the wrapper's dependencies.
-    if [ -f /linkerconfig/ld.config.txt ]; then
-        tmp=$(mktemp -t ld-config.XXXXXX) || true
-        if [ -n "$tmp" ]; then
-            if ! grep -q '^namespace.sphal.search.paths += /system/${LIB}$' /linkerconfig/ld.config.txt 2>/dev/null; then
-                sed -e '/^namespace.sphal.search.paths = /a\namespace.sphal.search.paths += /system/${LIB}' \
-                    /linkerconfig/ld.config.txt > "$tmp" \
-                    && mount --bind "$tmp" /linkerconfig/ld.config.txt \
-                    && log "Patched linkerconfig: sphal can search /system/lib64" \
-                    || log "WARN: failed to patch linkerconfig"
-            else
-                rm -f "$tmp"
-            fi
-        fi
-    fi
 fi
 
 # Patch audio policy config: add AUDIO_FORMAT_PCM_16_BIT profiles to primary output
@@ -474,113 +457,12 @@ fi
 echo 0 > /sys/fs/selinux/enforce 2>/dev/null && log "SELinux set to permissive"
 
 # Android 11+ uses /linkerconfig for dynamic linker configuration.
-# The pre-populated ld.config.txt in the SFOS rootfs is often stale (small).
-# Regenerate it here to ensure vendor HALs can find their libs.
-log "Checking /linkerconfig status..."
-if [ -f /linkerconfig/ld.config.txt ]; then
-    log "linkerconfig ok: $(wc -c < /linkerconfig/ld.config.txt) bytes"
-    log "linkerconfig contents: $(ls -lA /linkerconfig | tr -s ' ' | tr '\n' ' ')"
-else
-    log "WARN: /linkerconfig/ld.config.txt missing — linker will use defaults"
-    log "linkerconfig dir: $(ls -lA /linkerconfig 2>&1 | tr '\n' ' ')"
-fi
-
-# The linkerconfig must be the full Android-generated one with ${LIB} substitution
-# so that both 32-bit and 64-bit vendor binaries (e.g. HIDL audio HAL) can find
-# their libraries in /vendor/lib and /vendor/lib64 respectively.
-# A copy is kept at /mnt/vendor/persist/ld.config.txt so it survives Android→SailfishOS
-# reboots (Android regenerates /linkerconfig on each boot; switch_root discards it).
-PERSIST_LDCFG=/mnt/vendor/persist/ld.config.txt
+# /etc/droid-hybris/ld.config.txt is a pre-built patched version of the Android-generated
+# linkerconfig that adds droid-hybris binary paths and vendor /system namespace access.
+# It is bind-mounted after droid-hal-init's SetupMountNamespaces (see below).
 LIVE_LDCFG=/linkerconfig/ld.config.txt
 mkdir -p /linkerconfig
-lc_size="$(stat -c %s $LIVE_LDCFG 2>/dev/null || echo 0)"
-if [ "$lc_size" -ge 100000 ]; then
-    # Full Android-generated linkerconfig is present — save a backup for next boot
-    cp -f $LIVE_LDCFG $PERSIST_LDCFG 2>/dev/null \
-        && log "linkerconfig ok (${lc_size}b): saved backup to persist" \
-        || log "linkerconfig ok (${lc_size}b): backup save failed"
-elif [ -f $PERSIST_LDCFG ] && [ "$(stat -c %s $PERSIST_LDCFG 2>/dev/null || echo 0)" -ge 100000 ]; then
-    # Restore from last good copy saved from Android boot
-    cp -f $PERSIST_LDCFG $LIVE_LDCFG \
-        && log "linkerconfig restored from persist ($(wc -c < $LIVE_LDCFG)b)" \
-        || log "WARN: linkerconfig restore from persist failed"
-else
-    log "WARN: no full linkerconfig available (${lc_size}b) — vendor 32-bit HALs may fail to load"
-    log "  To fix: boot into Android once to regenerate /linkerconfig, then reboot to SailfishOS"
-fi
-log "linkerconfig: $(wc -c < $LIVE_LDCFG 2>/dev/null || echo '?')b, ${LIB}-capable: $(grep -c '\${LIB}' $LIVE_LDCFG 2>/dev/null || echo 0) paths"
-
-# droid-hybris binaries (minimediaservice etc.) live outside Android's dir. mappings.
-# Without a matching dir.system entry the linker assigns them a minimal namespace
-# that lacks APEX links (libandroidicu.so from com.android.i18n is unreachable).
-# Prepend the path so they get the full [system] namespace on every boot.
-_lc_needs_direntry=false
-_lc_needs_searchpath=false
-grep -qF 'dir.system = /usr/libexec/droid-hybris/' $LIVE_LDCFG 2>/dev/null || _lc_needs_direntry=true
-grep -qF '/usr/libexec/droid-hybris/system/${LIB}' $LIVE_LDCFG 2>/dev/null || _lc_needs_searchpath=true
-if $_lc_needs_direntry || $_lc_needs_searchpath; then
-    tmp=$(mktemp -t ld-droidhybris.XXXXXX) || true
-    if [ -n "$tmp" ]; then
-        # Prepend dir.system so droid-hybris binaries get the full [system] namespace
-        # (APEX links, libandroidicu.so etc.). Also add the droid-hybris lib path to
-        # namespace.default.search.paths so new libraries deployed there (e.g.
-        # libdroidmedia_binder_compat.so) are found without a system image rebuild.
-        # Both patches are idempotent — skip whichever is already present.
-        _lc_input=$LIVE_LDCFG
-        if $_lc_needs_direntry; then
-            { printf 'dir.system = /usr/libexec/droid-hybris/\n'; cat $_lc_input; } > "$tmp"
-            _lc_input=$tmp
-        fi
-        if $_lc_needs_searchpath; then
-            # BusyBox sed lacks '0,/pattern/' (GNU-only). Use awk to insert after first match.
-            _ln=$(grep -n '^namespace\.default\.search\.paths = /system/\${LIB}$' $_lc_input | head -1 | cut -d: -f1)
-            if [ -n "$_ln" ]; then
-                awk -v ln="$_ln" 'NR==ln{print; print "namespace.default.search.paths += /usr/libexec/droid-hybris/system/${LIB}"; next} {print}' \
-                    $_lc_input > "${tmp}.2" && mv "${tmp}.2" "$tmp"
-            fi
-        fi
-        mount --bind "$tmp" $LIVE_LDCFG \
-            && log "Patched linkerconfig: dir.system=$(! $_lc_needs_direntry && echo already || echo added) search_path=$(! $_lc_needs_searchpath && echo already || echo added)" \
-            || log "WARN: failed to patch linkerconfig for droid-hybris"
-    fi
-fi
-
-# qcrild/vendor-HAL fix: the persisted Android linkerconfig isolates the [vendor]
-# namespace from /system (permitted.paths lacks /system). But vendor binaries
-# (qcrild, qseecomd, and many HALs) dlopen /system/lib64/libc++.so — the runtime
-# APEX only symlinks libc++.so back to /system, it ships no own copy. Without
-# /system access they fail "CANNOT LINK ... libc++.so not accessible for namespace
-# (default)" and crash-loop. We append /system/${LIB} to the [vendor] default
-# namespace, placed AFTER /vendor/${LIB} so libbinder.so still resolves to /vendor
-# FIRST (single copy in one namespace → no SYST/VNDR "Mixing copies of libbinder").
-# Patches the LIVE config only (persist stays pristine — backed up above). Idempotent.
-patch_vendor_linkerconfig() {
-    local cfg=$LIVE_LDCFG
-    [ -f "$cfg" ] || { log "WARN: no linkerconfig to patch for /system access"; return 0; }
-    if awk '/^\[/{s=$0} s=="[vendor]" && /^namespace\.default\.search\.paths \+= \/system\/\$\{LIB\}/{f=1} END{exit !f}' "$cfg"; then
-        log "vendor linkerconfig already grants /system access — skipping"
-        return 0
-    fi
-    local tmp; tmp=$(mktemp -t ldcfg.XXXXXX) || return 1
-    awk '
-      /^\[/ { invendor = ($0=="[vendor]") }
-      { print }
-      invendor && $0=="namespace.default.search.paths += /vendor/${LIB}/egl" { print "namespace.default.search.paths += /system/${LIB}" }
-      invendor && $0=="namespace.default.permitted.paths += /system/vendor" { print "namespace.default.permitted.paths += /system" }
-    ' "$cfg" > "$tmp"
-    # Verify BOTH lines landed in [vendor] before committing — a partial patch
-    # (permitted without search) would still fail to link, so refuse it.
-    local got
-    got=$(awk '/^\[/{s=$0} s=="[vendor]" && (/^namespace\.default\.search\.paths \+= \/system\/\$\{LIB\}/ || /^namespace\.default\.permitted\.paths \+= \/system$/)' "$tmp" | wc -l)
-    if [ "$got" -eq 2 ]; then
-        cat "$tmp" > "$cfg" && log "Patched vendor linkerconfig: +/system/\${LIB} search + /system permitted ([vendor] only, after /vendor)" \
-            || log "WARN: failed to write patched linkerconfig"
-    else
-        log "WARN: vendor linkerconfig patch produced $got/2 expected lines — NOT applied (config format drift?)"
-    fi
-    rm -f "$tmp"
-}
-patch_vendor_linkerconfig
+log "linkerconfig: init-generated $(wc -c < $LIVE_LDCFG 2>/dev/null || echo '?')b — static overlay will mount after SetupMountNamespaces"
 
 # Ensure /data exists for HAL services that expect Android data paths.
 # TRD-010: qcrild and droid-hal-init need Android /data/property (persist
@@ -900,24 +782,19 @@ fi
 # RilServiceModule_1_4 races qcril_init dispatch.
 sleep 3
 
-# Re-apply linkerconfig search path patch after droid-hal-init's SetupMountNamespaces.
-# init mounts a fresh tmpfs on /linkerconfig during startup, burying the earlier bind-mount.
-# Re-patching here ensures minimediaservice (and other droid-hybris binaries started below)
-# can find libdroidmedia_binder_compat.so in /usr/libexec/droid-hybris/system/lib64.
-if ! grep -qF '/usr/libexec/droid-hybris/system/${LIB}' $LIVE_LDCFG 2>/dev/null; then
-    _ln2=$(grep -n '^namespace\.default\.search\.paths = /system/\${LIB}$' $LIVE_LDCFG | head -1 | cut -d: -f1)
-    if [ -n "$_ln2" ]; then
-        _tmp2=$(mktemp -t ld-droidhybris2.XXXXXX) || true
-        if [ -n "$_tmp2" ]; then
-            awk -v ln="$_ln2" 'NR==ln{print; print "namespace.default.search.paths += /usr/libexec/droid-hybris/system/${LIB}"; next} {print}' \
-                $LIVE_LDCFG > "${_tmp2}.2" && mv "${_tmp2}.2" "$_tmp2" \
-                && mount --bind "$_tmp2" $LIVE_LDCFG \
-                && log "Re-patched linkerconfig search_path after init SetupMountNamespaces" \
-                || log "WARN: failed to re-patch linkerconfig search_path"
-        fi
-    fi
+# Mount the pre-built patched linkerconfig after droid-hal-init's SetupMountNamespaces.
+# init mounts a fresh tmpfs on /linkerconfig during second-stage startup, replacing
+# any earlier bind-mount. We mount our static file at this point rather than awk-patching
+# the init-generated one. The static file includes all required patches:
+#   [system] namespace: dir.system for droid-hybris, droid-hybris lib search path
+#   [vendor] namespace: /system/${LIB} search + /system permitted (for qcrild, HALs)
+LC_STATIC=/etc/droid-hybris/ld.config.txt
+if [ -f "$LC_STATIC" ]; then
+    mount --bind "$LC_STATIC" "$LIVE_LDCFG" \
+        && log "linkerconfig: mounted static overlay ($LC_STATIC, $(wc -l < $LC_STATIC) lines)" \
+        || log "WARN: failed to bind-mount static linkerconfig — vendor HALs may fail"
 else
-    log "linkerconfig search_path already present after init (no re-patch needed)"
+    log "WARN: static linkerconfig not found at $LC_STATIC — using init-generated config"
 fi
 
 # Explicitly start HAL services that were disabled by class_start main removal.
