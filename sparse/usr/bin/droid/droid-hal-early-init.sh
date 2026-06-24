@@ -209,31 +209,57 @@ ensure_mp /linkerconfig
 PERSIST_LDCFG=/mnt/vendor/persist/ld.config.txt
 if [ -f "$PERSIST_LDCFG" ] && [ "$(stat -c %s "$PERSIST_LDCFG" 2>/dev/null || echo 0)" -ge 100000 ]; then
     log "Restoring full linkerconfig from persist ($(stat -c %s "$PERSIST_LDCFG") bytes)"
-    cp -f "$PERSIST_LDCFG" /linkerconfig/ld.config.txt
+    # Apply hybris patches in one awk pass:
+    #  1. Prepend dir.system for /usr/libexec/droid-hybris/ (minimediaservice namespace)
+    #  2. Add droid-hybris lib search path after namespace.default.search.paths = /system/${LIB}
+    #  3. Add /system/${LIB} search + /system permitted to [vendor] namespace (qcrild, HALs)
+    awk '
+      BEGIN {
+          print "dir.system = /usr/libexec/droid-hybris/"
+          done_hybris = 0
+          invendor = 0
+      }
+      /^\[/ { invendor = ($0 == "[vendor]") }
+      { print }
+      !done_hybris && /^namespace\.default\.search\.paths = \/system\/\$\{LIB\}$/ {
+          print "namespace.default.search.paths += /usr/libexec/droid-hybris/system/${LIB}"
+          done_hybris = 1
+      }
+      invendor && /^namespace\.default\.search\.paths \+= \/vendor\/\$\{LIB\}\/egl$/ {
+          print "namespace.default.search.paths += /system/${LIB}"
+      }
+      invendor && /^namespace\.default\.permitted\.paths \+= \/system\/vendor$/ {
+          print "namespace.default.permitted.paths += /system"
+      }
+    ' "$PERSIST_LDCFG" > /linkerconfig/ld.config.txt \
+        && log "linkerconfig: patched $(wc -l < /linkerconfig/ld.config.txt) lines into bootstrap" \
+        || { log "WARN: linkerconfig awk patch failed — copying unpatch persist"; cp -f "$PERSIST_LDCFG" /linkerconfig/ld.config.txt; }
 elif [ -f /linkerconfig/ld.config.txt ] && [ "$(stat -c %s /linkerconfig/ld.config.txt 2>/dev/null || echo 0)" -ge 100000 ]; then
-    log "Using existing full linkerconfig"
+    log "Using existing full linkerconfig (no persist copy available)"
 else
     rm -f /linkerconfig/ld.config.txt
     log "Generating minimal linkerconfig fallback for Android 15"
     cat > /linkerconfig/ld.config.txt <<'LDCFG'
+dir.system = /usr/libexec/droid-hybris/
 dir.system = /system/bin
 dir.vendor = /vendor/bin
 
 [system]
 additional.namespaces = default
 namespace.default.isolated = false
-namespace.default.search.paths = /system/lib64/bootstrap:/system/lib64:/system/lib64/hw:/system_ext/lib64:/product/lib64:/odm/lib64:/apex/com.android.runtime/lib64:/apex/com.android.i18n/lib64:/apex/com.android.conscrypt/lib64
-namespace.default.permitted.paths = /system:/vendor:/system_ext:/product:/odm:/apex:/data
+namespace.default.search.paths = /usr/libexec/droid-hybris/system/lib64
+namespace.default.search.paths += /system/lib64/bootstrap:/system/lib64:/system/lib64/hw:/system_ext/lib64:/product/lib64:/odm/lib64:/apex/com.android.runtime/lib64:/apex/com.android.i18n/lib64:/apex/com.android.conscrypt/lib64
+namespace.default.permitted.paths = /system:/vendor:/system_ext:/product:/odm:/apex:/data:/usr/libexec/droid-hybris
 namespace.default.asan.search.paths = /system/lib64
 
 [vendor]
 additional.namespaces = default
 namespace.default.isolated = false
-namespace.default.search.paths = /vendor/lib64:/vendor/lib64/hw:/system/lib64/bootstrap:/system/lib64:/system/lib64/hw:/system_ext/lib64:/product/lib64:/odm/lib64:/apex/com.android.runtime/lib64:/apex/com.android.i18n/lib64:/apex/com.android.conscrypt/lib64
+namespace.default.search.paths = /vendor/lib64:/vendor/lib64/hw:/system/lib64:/system/lib64/bootstrap:/system/lib64/hw:/system_ext/lib64:/product/lib64:/odm/lib64:/apex/com.android.runtime/lib64:/apex/com.android.i18n/lib64:/apex/com.android.conscrypt/lib64
 namespace.default.permitted.paths = /system:/vendor:/system_ext:/product:/odm:/apex:/data
 namespace.default.asan.search.paths = /vendor/lib64
 LDCFG
 fi
-log "Linkerconfig ready: $(wc -c < /linkerconfig/ld.config.txt 2>/dev/null || echo 0) bytes"
+log "linkerconfig: bootstrap ready — $(wc -l < /linkerconfig/ld.config.txt 2>/dev/null || echo 0) lines"
 
 log "Done: system=$(mountpoint -q /system && echo ok || echo FAIL) vendor=$(mountpoint -q /vendor && echo ok || echo FAIL) apex_tmpfs=$(mountpoint -q /apex && echo ok || echo FAIL)"

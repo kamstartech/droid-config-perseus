@@ -462,7 +462,7 @@ echo 0 > /sys/fs/selinux/enforce 2>/dev/null && log "SELinux set to permissive"
 # It is bind-mounted after droid-hal-init's SetupMountNamespaces (see below).
 LIVE_LDCFG=/linkerconfig/ld.config.txt
 mkdir -p /linkerconfig
-log "linkerconfig: init-generated $(wc -c < $LIVE_LDCFG 2>/dev/null || echo '?')b — static overlay will mount after SetupMountNamespaces"
+log "linkerconfig: bootstrap patched in early-init — will re-mount after SetupMountNamespaces"
 
 # Ensure /data exists for HAL services that expect Android data paths.
 # TRD-010: qcrild and droid-hal-init need Android /data/property (persist
@@ -777,25 +777,41 @@ else
     log "WARN: apex-post-setup.sh not found"
 fi
 
-# Additional stabilization delay: droid-hal-init's post-fs-data action and
-# vendor HAL .rc parsing must complete before qcrild starts, otherwise
-# RilServiceModule_1_4 races qcril_init dispatch.
-sleep 3
+# Wait for droid-hal-init's SetupMountNamespaces to replace /linkerconfig with a
+# fresh tmpfs. Detect it via /proc/mounts — the moment tmpfs appears on /linkerconfig
+# the early-init bind-mount (bootstrap) is buried and we can re-mount our patched copy.
+log "Waiting for SetupMountNamespaces (/linkerconfig tmpfs)..."
+_lc_detected=0
+for _i in $(seq 1 30); do
+    if grep -q 'tmpfs /linkerconfig ' /proc/mounts 2>/dev/null; then
+        log "SetupMountNamespaces: /linkerconfig tmpfs detected after ${_i}s"
+        _lc_detected=1
+        break
+    fi
+    sleep 1
+done
+[ "$_lc_detected" -eq 0 ] && log "WARN: /linkerconfig tmpfs not seen after 30s — proceeding"
 
-# Mount the pre-built patched linkerconfig after droid-hal-init's SetupMountNamespaces.
-# init mounts a fresh tmpfs on /linkerconfig during second-stage startup, replacing
-# any earlier bind-mount. We mount our static file at this point rather than awk-patching
-# the init-generated one. The static file includes all required patches:
-#   [system] namespace: dir.system for droid-hybris, droid-hybris lib search path
-#   [vendor] namespace: /system/${LIB} search + /system permitted (for qcrild, HALs)
-LC_STATIC=/etc/droid-hybris/ld.config.txt
-if [ -f "$LC_STATIC" ]; then
-    mount --bind "$LC_STATIC" "$LIVE_LDCFG" \
-        && log "linkerconfig: mounted static overlay ($LC_STATIC, $(wc -l < $LC_STATIC) lines)" \
-        || log "WARN: failed to bind-mount static linkerconfig — vendor HALs may fail"
-else
-    log "WARN: static linkerconfig not found at $LC_STATIC — using init-generated config"
-fi
+# Re-mount the bootstrap config (patched in early-init) over the init-generated one.
+# /linkerconfig/bootstrap is still reachable directly even though /linkerconfig is now
+# a fresh tmpfs — the linkerconfig.mount bind of bootstrap over /linkerconfig was buried,
+# not destroyed.
+mount --bind /linkerconfig/bootstrap/ld.config.txt "$LIVE_LDCFG" \
+    && log "linkerconfig: re-mounted patched bootstrap ($(wc -l < /linkerconfig/bootstrap/ld.config.txt) lines)" \
+    || log "WARN: failed to re-mount bootstrap linkerconfig — vendor HALs may fail"
+
+# Wait for vendor RC files to be parsed before starting HAL services.
+# Android init sets init.svc.<name> = "stopped" the moment it parses a service entry.
+# Waiting for vendor.qcrild to appear means all vendor RC files up to qcrild.rc are done.
+log "Waiting for vendor RC parsing (init.svc.vendor.qcrild)..."
+for _i in $(seq 1 30); do
+    _svc=$(getprop init.svc.vendor.qcrild 2>/dev/null)
+    if [ -n "$_svc" ]; then
+        log "vendor RC parsed after ${_i}s (init.svc.vendor.qcrild=${_svc})"
+        break
+    fi
+    sleep 1
+done
 
 # Explicitly start HAL services that were disabled by class_start main removal.
 # Audio, vibrator, radio and WiFi/BT are in class main/late_start/hal, so they don't auto-start.
@@ -846,7 +862,7 @@ log "Vibrator sysfs permissions: $(ls -la /sys/class/leds/vibrator/activate 2>/d
 # included in the READY gate — PulseAudio is gated separately via a drop-in
 # (50-adsp-wait.conf ExecStartPre) that blocks PA until t=120s when APR is ready.
 # All other services (lipstick, ofono, sensorfwd) start immediately.
-systemd-notify --ready 2>/dev/null && log "Sent sd_notify READY (HWComposer up, PA gated via 50-adsp-wait.conf)"
+systemd-notify --ready 2>/dev/null && log "Sent sd_notify READY (HWComposer up, droid-card loaded via droid-card-delayed.service)"
 
 # TAS2557 SmartPA boot-recovery:
 # PA starts at t=120s; module-droid-card is loaded from droid.pa at PA startup.
