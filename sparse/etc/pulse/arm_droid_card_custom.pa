@@ -1,1 +1,1 @@
-load-module module-droid-card rate=48000 voice_vsid=297816064 use_legacy_stream_set_parameters=true
+load-module module-droid-card rate=48000 use_legacy_stream_set_parameters=true
