@@ -29,22 +29,6 @@ chmod 1777 /tmp 2>/dev/null || true
 chown root:root /tmp 2>/dev/null || true
 log "Fixed /tmp permissions: $(stat -c '%a %U:%G' /tmp 2>/dev/null || echo 'unknown')"
 
-# Fix permissions on the dedicated binder_guest/hwbinder_guest/vndbinder_guest
-# devices for the harbour-containers Android guest (TRD-041). The kernel's
-# binder driver never sets an explicit mode on any binder misc device
-# (drivers/android/binder.c init_binder_device()), so these fall back to
-# devtmpfs's default of 0600 root:root. /dev/binder/hwbinder/vndbinder get
-# 0666 from a udev rule shipped by a Jolla RPM (KERNEL=="binder", etc.) that
-# only matches those three literal names, not the _guest ones -- confirmed
-# live: without this, the guest's non-root servicemanager gets EACCES on
-# open() and can never start. Bind mounts share the host inode, so a chmod
-# here (once per host boot, before any container starts) is sufficient --
-# no per-container-start fixup is needed.
-for node in binder_guest hwbinder_guest vndbinder_guest; do
-    [ -e "/dev/$node" ] && chmod 0666 "/dev/$node" 2>/dev/null
-done
-log "binder_guest device permissions: $(ls -la /dev/binder_guest /dev/hwbinder_guest /dev/vndbinder_guest 2>/dev/null | awk '{print $1,$3,$4,$NF}' | tr '\n' ' ' || echo 'nodes not found')"
-
 create_node() {
     local path="$1"
     local type="$2"
@@ -876,6 +860,26 @@ for node in activate duration state brightness; do
         chmod 0666 "/sys/class/leds/vibrator/$node" 2>/dev/null
 done
 log "Vibrator sysfs permissions: $(ls -la /sys/class/leds/vibrator/activate 2>/dev/null | awk '{print $1,$3,$4}' || echo 'node not found')"
+
+# Fix permissions on the dedicated binder_guest/hwbinder_guest/vndbinder_guest
+# devices for the harbour-containers Android guest (TRD-041). The kernel's
+# binder driver never sets an explicit mode on any binder misc device
+# (drivers/android/binder.c init_binder_device()), so these fall back to
+# devtmpfs's default of 0600 root:root. /dev/binder/hwbinder/vndbinder get
+# 0666 from a udev rule shipped by a Jolla RPM (KERNEL=="binder", etc.) that
+# only matches those three literal names, not the _guest ones. A chmod
+# placed earlier in this script (right after the /tmp fix) was confirmed
+# live to be reverted back to 0600 by the time boot finishes -- ueventd's
+# own cold-boot uevent replay re-applies its rule-derived (or, for
+# unmatched devices like these, devtmpfs-default) permission to every
+# device node during its scan, which runs after that early point but
+# before this one. Same reasoning as the vibrator fix above: this must
+# run after ueventd's cold-boot pass has finished, so it's placed here
+# instead. Confirmed live: a chmod applied at this point in boot sticks.
+for node in binder_guest hwbinder_guest vndbinder_guest; do
+    [ -e "/dev/$node" ] && chmod 0666 "/dev/$node" 2>/dev/null
+done
+log "binder_guest device permissions: $(ls -la /dev/binder_guest /dev/hwbinder_guest /dev/vndbinder_guest 2>/dev/null | awk '{print $1,$3,$4,$NF}' | tr '\n' ' ' || echo 'nodes not found')"
 
 # Notify systemd that droid-hal-init and HWComposer are up. ADSP audio is NOT
 # included in the READY gate — PulseAudio is gated separately via a drop-in
