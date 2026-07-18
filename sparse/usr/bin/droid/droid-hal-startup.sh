@@ -29,6 +29,22 @@ chmod 1777 /tmp 2>/dev/null || true
 chown root:root /tmp 2>/dev/null || true
 log "Fixed /tmp permissions: $(stat -c '%a %U:%G' /tmp 2>/dev/null || echo 'unknown')"
 
+# Fix permissions on the dedicated binder_guest/hwbinder_guest/vndbinder_guest
+# devices for the harbour-containers Android guest (TRD-041). The kernel's
+# binder driver never sets an explicit mode on any binder misc device
+# (drivers/android/binder.c init_binder_device()), so these fall back to
+# devtmpfs's default of 0600 root:root. /dev/binder/hwbinder/vndbinder get
+# 0666 from a udev rule shipped by a Jolla RPM (KERNEL=="binder", etc.) that
+# only matches those three literal names, not the _guest ones -- confirmed
+# live: without this, the guest's non-root servicemanager gets EACCES on
+# open() and can never start. Bind mounts share the host inode, so a chmod
+# here (once per host boot, before any container starts) is sufficient --
+# no per-container-start fixup is needed.
+for node in binder_guest hwbinder_guest vndbinder_guest; do
+    [ -e "/dev/$node" ] && chmod 0666 "/dev/$node" 2>/dev/null
+done
+log "binder_guest device permissions: $(ls -la /dev/binder_guest /dev/hwbinder_guest /dev/vndbinder_guest 2>/dev/null | awk '{print $1,$3,$4,$NF}' | tr '\n' ' ' || echo 'nodes not found')"
+
 create_node() {
     local path="$1"
     local type="$2"
