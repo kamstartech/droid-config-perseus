@@ -1,0 +1,34 @@
+[Unit]
+Description=Kaos droid-hal-init (Android vendor HAL / WLAN bring-up)
+After=local-fs.target systemd-tmpfiles-setup.service
+Before=graphical.target
+DefaultDependencies=no
+Conflicts=shutdown.target
+ConditionPathExists=!/etc/kaos-overlay-active
+# After=local-fs.target (not the individual vendor/system/firmware_mnt mount
+# units by name): they're WantedBy=local-fs.target, so this ordering already
+# guarantees they've completed -- the same idiom SailfishOS's own
+# droid-hal-init.service uses. Android init can only start once per boot --
+# if it dies, don't restart it.
+# ConditionPathExists=!/etc/kaos-overlay-active: this unit is installed
+# rootfs-wide (WantedBy=graphical.target), and the SAME rootfs also gets
+# booted by kaos-service's overlay/namespace mode, where Android is already
+# fully up and droid-hal-init already ran for real. Without this gate, real
+# systemd running inside kaos-service's chroot (ns-entry.sh) would exec a
+# SECOND droid-hal-init that fights the running one for the same
+# hwservicemanager/HIDL registrations -- confirmed live 2026-09-23: overlay
+# session went Inactive shortly after this unit was added, with no other
+# change to explain it. ns-entry.sh touches the marker right before exec'ing
+# systemd; kaos.init (switch_root-only) removes it at the very start of its
+# own run so a stale marker from a prior overlay session can't mask this
+# unit during a real cold boot.
+
+[Service]
+Type=simple
+# Intentionally un-sandboxed: bind-mount-patches real vendor/system rc files
+# before exec'ing droid-hal-init.
+ExecStart=/bin/sh /usr/local/sbin/kaos-droid-hal-init.sh
+TimeoutSec=60
+
+[Install]
+WantedBy=graphical.target

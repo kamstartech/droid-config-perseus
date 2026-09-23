@@ -1,0 +1,246 @@
+#!/bin/sh
+# kaos.init — cold-boot adapter. Runs from the trampoline
+# (system/extras/multirom/trampoline/trampoline.c, cold_boot_pivot_root())
+# inside the target rootfs, after pivot_root and before the distro's init
+# execs. Two jobs:
+#
+#   1. dm refresh — expose the dm-linear dynamic-partition devices Android's
+#      own first-stage init already created (system/vendor/product/odm/
+#      system_ext) as /dev/mapper/<name> and /run/droid/<name>.
+#   2. boot adaptation — feature-detect what the distro already provides and
+#      fill only the gaps, using the distro's own system scripts (systemd
+#      units), so a distro doesn't have to ship Kaos-specific wiring to boot
+#      here. Distros that bring their own setup (SailfishOS: native systemd
+#      .mount units + lipstick) are detected and left untouched.
+#
+# Shared, byte-identical logic used two ways in this project:
+#   - SailfishOS: this file IS /kaos.init directly (hybris/droid-configs/
+#     sparse/kaos.init) -- trampoline execs it before systemd starts, and
+#     SailfishOS's own native systemd .mount units do the actual mounting
+#     from /run/droid/<name> afterward.
+#   - Droidian/Ubuntu Touch: this file is droid-dm-setup.sh (kaos/apps/
+#     phosh-app/res/raw/droid_dm_setup.sh), called as the first step of
+#     mount-android-system.sh (itself deployed as /kaos.init for those
+#     distros), which does its own additional /android/* mounting on top.
+#
+# Keep both copies in sync -- there is no automated single-source step
+# between the two separate build/packaging systems these live in.
+#
+# Constructs NO dm-linear table itself -- there's nothing to compute here
+# that the kernel doesn't already have. trampoline's hook point
+# (run_init_second_stage()) fires after Android's real first-stage init has
+# already done dynamic-partition resolution and created the real dm-N
+# devices, on every boot, cold or warm, unconditionally. An earlier version
+# of this file (both copies) instead hardcoded a per-device dm-linear table
+# "captured from Android dmctl output on perseus" and tried to recreate it
+# via dmsetup create -- confirmed live (2026-08-18) that table had already
+# drifted from reality (live `dmctl table system` showed 4 segments
+# totaling 2252832 sectors on major:minor 259:39; the hardcoded table
+# claimed a single 2246232-sector segment on /dev/block/sde48) and was
+# never actually being applied anyway: the dmsetup create calls always hit
+# the already-real devices and failed with EBUSY, silently falling through
+# to the refresh_nodes() logic below. Removed the hardcoded table and
+# everything that only existed to support it, rather than fixing it.
+
+log() {
+    echo "[kaos-dm-refresh] $*" > /dev/kmsg 2>/dev/null
+    echo "[kaos-dm-refresh] $*"
+    # Persistent trace: /var/log lives on the distro rootfs (on /data), so this
+    # survives a failed cold boot rebooting back to Android, where dmesg no
+    # longer holds the pre-systemd ring buffer.
+    mkdir -p /var/log 2>/dev/null
+    echo "[kaos-dm-refresh] $*" >> /var/log/kaos-coldboot.log 2>/dev/null
+}
+
+refresh_nodes() {
+    mkdir -p /dev/block/mapper /dev/mapper /run/droid
+    for p in /sys/block/dm-*/dm/name; do
+        [ -f "$p" ] || continue
+        local n dm_num major minor id
+        n=$(cat "$p")
+        [ -n "$n" ] || continue
+        dm_num=$(basename "$(dirname "$(dirname "$p")")" | sed 's/dm-//')
+        id=$(cat "/sys/block/dm-$dm_num/dev" 2>/dev/null)
+        major=${id%%:*}
+        minor=${id#*:}
+        [ -b "/dev/block/dm-$dm_num" ] || mknod "/dev/block/dm-$dm_num" b "$major" "$minor" 2>/dev/null
+        # /dev/mapper/ is only ONE level under /dev/ -- a "../../" here
+        # resolves to /block/dm-N (missing /dev), a dangling symlink.
+        # Confirmed via a real boot (Droidian, pre-unification) that this
+        # exact mistake made every /dev/mapper/* entry dangle despite
+        # ls/stat on the symlink itself looking fine, since neither
+        # dereferences the target by default.
+        ln -sf "../block/dm-$dm_num" "/dev/mapper/$n" 2>/dev/null || true
+        ln -sf "/dev/mapper/$n" "/run/droid/$n" 2>/dev/null || true
+        # Re-emit uevent so systemd-udevd (which started after Android init created
+        # these dm devices) notices them and populates dev-dm-X.device units.
+        printf add > "/sys/block/dm-$dm_num/uevent" 2>/dev/null && log "uevent add dm-$dm_num ($n)"
+    done
+}
+
+# --- Boot adaptation (feature-detected, distro-agnostic) -----------------
+# Fill only what the distro is missing so it starts its session here, using
+# the distro's own systemd units. Device constants come from
+# /usr/local/share/kaos/device.conf (seeded by the rootfs build); perseus
+# defaults apply when it is absent. Cold boot owns these files: this writes
+# the DRM path, and a later warm namespace start rewrites them for the
+# overlay/headless path (kaos-service), so the last writer always matches the
+# mode actually booting.
+adapt_boot() {
+    [ -f /usr/local/share/kaos/device.conf ] && \
+        . /usr/local/share/kaos/device.conf
+    : "${DEV_DRM_CARD:=/dev/dri/card0}"
+    : "${DEV_DRM_CARD_MAJOR:=226}"
+    : "${DEV_DRM_CARD_MINOR:=0}"
+    : "${DEV_DRM_RENDER:=/dev/dri/renderD128}"
+    : "${DEV_DRM_RENDER_MAJOR:=226}"
+    : "${DEV_DRM_RENDER_MINOR:=128}"
+    : "${DEV_DISPLAY_SIZE:=1080x2340}"
+    : "${DEV_MESA_KGSL:=/usr/local/mesa-kgsl}"
+
+    # Only systemd distros are adapted; anything else boots via its own init
+    # (or the kaos-init fallback) and is left alone.
+    [ -x /usr/lib/systemd/systemd ] || { log "boot: no systemd -- no adaptation"; return 0; }
+
+    # SELinux: this kernel boots Android's SELinux in permissive mode and the
+    # distro has no policy installed. Without /etc/selinux/config, libselinux/
+    # systemd try to load a policy that isn't there and systemd dies at startup
+    # (confirmed: an ubuntu cold boot got only
+    #   "SELinux: Could not open policy file <= /etc/selinux/targeted/policy/policy.33"
+    # in boot.log, then no journald/no session). SailfishOS ships
+    # SELINUX=disabled and cold-boots fine -- give any distro that has SELinux
+    # userspace but no config the same setting.
+    if [ -d /etc/selinux ] && [ ! -e /etc/selinux/config ]; then
+        echo 'SELINUX=disabled' > /etc/selinux/config
+        log "boot: wrote /etc/selinux/config (disabled)"
+    fi
+
+    # SailfishOS is self-managed (lipstick compositor + native .mount units).
+    if [ -e /usr/bin/lipstick ] || grep -qs '^ID=sailfishos' /etc/os-release 2>/dev/null; then
+        log "boot: self-managed distro -- no adaptation"
+        return 0
+    fi
+
+    # Phosh distro that ships phosh.service: make sure it actually starts on
+    # boot and has the KGSL/DRM environment this device needs.
+    if [ -e /usr/lib/systemd/system/phosh.service ]; then
+        # DRM nodes: in the cold path /dev is a fresh devtmpfs, so card0/
+        # renderD128 exist as root:root 0600 -- but phoc runs as uid 1000 and
+        # must open them ("Failed to open /dev/dri/renderD128: Permission
+        # denied" -> "no DRM FD available" -> phoc exits 1). Create-if-missing
+        # from the device declaration and relax perms, mirroring the overlay
+        # path's ns-entry.sh mknod.
+        mkdir -p /dev/dri 2>/dev/null
+        [ -e "$DEV_DRM_CARD" ] || mknod -m 0666 "$DEV_DRM_CARD" c \
+            "$DEV_DRM_CARD_MAJOR" "$DEV_DRM_CARD_MINOR" 2>/dev/null
+        [ -e "$DEV_DRM_RENDER" ] || mknod -m 0666 "$DEV_DRM_RENDER" c \
+            "$DEV_DRM_RENDER_MAJOR" "$DEV_DRM_RENDER_MINOR" 2>/dev/null
+        chmod 0666 "$DEV_DRM_CARD" "$DEV_DRM_RENDER" 2>/dev/null
+        log "boot: DRM nodes ready ($DEV_DRM_CARD, $DEV_DRM_RENDER)"
+
+        # systemd-udevd then re-applies 50-udev-default.rules: renderD* becomes
+        # GROUP="render" MODE="0660" (card0 is GROUP="video"). phoc runs as
+        # uid 1000, which is in 'video' but not 'render' -> "Failed to open
+        # /dev/dri/renderD128: Permission denied" -> "no DRM FD available".
+        # Add the uid-1000 user to 'render' when that group exists (overlay
+        # sidesteps this with a fake-seat shim; the cold path opens the real
+        # nodes).
+        if getent group render >/dev/null 2>&1; then
+            _u=$(getent passwd 1000 2>/dev/null | cut -d: -f1)
+            if [ -n "$_u" ] && ! id -nG "$_u" 2>/dev/null | grep -qw render; then
+                { usermod -aG render "$_u" 2>/dev/null || gpasswd -a "$_u" render >/dev/null 2>&1; } && \
+                    log "boot: added $_u to render group"
+            fi
+        fi
+
+        mkdir -p /etc/systemd/system/graphical.target.wants
+        if [ ! -e /etc/systemd/system/graphical.target.wants/phosh.service ]; then
+            ln -sf /usr/lib/systemd/system/phosh.service \
+                /etc/systemd/system/graphical.target.wants/phosh.service
+            log "boot: enabled phosh.service on graphical.target"
+        fi
+        mkdir -p /etc/systemd/system/phosh.service.d
+        {
+            echo '# Written by /kaos.init at cold boot (DRM path). The warm'
+            echo '# namespace path rewrites this file for overlay/headless.'
+            echo '[Unit]'
+            echo 'ConditionPathExists='
+            echo 'After=systemd-logind.service'
+            echo 'Wants=systemd-logind.service'
+            echo '[Service]'
+            # Confirmed live: phoc crashes (first attempt SIGBUS, every
+            # restart after that a clean exit 1) with zero captured output
+            # under any journal tag, despite WLR_LOG=debug below and
+            # phosh-session exec'ing phoc directly (inherited fds, not a
+            # forked child) -- likely lost to stdio buffering on the crash
+            # path. Force it to a real file so the buffering doesn't matter.
+            echo 'StandardOutput=append:/var/log/kaos-phoc-debug.log'
+            echo 'StandardError=append:/var/log/kaos-phoc-debug.log'
+            # Keep this env identical to the overlay drop-in (kaos-service),
+            # except WLR_BACKENDS -- it is the proven-working KGSL/Mesa/zink
+            # setup. The missing VK_ICD_FILENAMES was what made zink fail here
+            # ("DRI2: failed to load driver" -> EGL_NOT_INITIALIZED).
+            echo 'Environment=WLR_BACKENDS=drm,libinput'
+            echo 'Environment=WLR_LOG=debug'
+            echo 'Environment=PHOC_DEBUG=auto-maximize'
+            echo 'Environment=WLR_RENDERER=gles2'
+            echo "Environment=WLR_RENDER_DRM_DEVICE=$DEV_DRM_RENDER"
+            echo 'Environment=WLR_DRM_NO_MODIFIERS=1'
+            echo 'Environment=MESA_LOADER_DRIVER_OVERRIDE=zink'
+            echo "Environment=LD_LIBRARY_PATH=$DEV_MESA_KGSL/lib:$DEV_MESA_KGSL/lib/dri"
+            echo "Environment=MESA_DRIVERS_PATH=$DEV_MESA_KGSL/lib/dri"
+            echo "Environment=LIBGL_DRIVERS_PATH=$DEV_MESA_KGSL/lib/dri"
+            echo "Environment=GBM_BACKENDS_PATH=$DEV_MESA_KGSL/lib/gbm"
+            echo "Environment=VK_ICD_FILENAMES=$DEV_MESA_KGSL/share/vulkan/icd.d/freedreno_icd.json"
+            # Seat: no seatd is installed and logind has no real VT here, so
+            # phoc cannot acquire a seat on its own. Use the same
+            # kaos-libseat-fake shim as the overlay path; it hands wlroots the
+            # real /dev/dri/card* for the DRM backend (see kaos-libseat-fake.c
+            # libseat_open_device).
+            echo 'Environment=LIBSEAT_BACKEND=logind'
+            echo 'Environment=LD_PRELOAD=/usr/local/lib/kaos-libseat-fake.so'
+            echo 'Environment=XDG_SEAT=seat0'
+        } > /etc/systemd/system/phosh.service.d/kaos.conf
+        log "boot: wrote cold-boot phosh environment"
+
+        mkdir -p /etc/phosh
+        {
+            echo '[core]'
+            echo 'xwayland=false'
+            echo
+            echo '[output:DSI-1]'
+            echo "mode = $DEV_DISPLAY_SIZE"
+            echo 'scale = 2'
+        } > /etc/phosh/phoc.ini
+        log "boot: wrote phoc.ini (DSI-1 $DEV_DISPLAY_SIZE)"
+
+        # Cold boot uses DRM, not the overlay frame relay. Drop any relay
+        # wiring left by a previous warm start (kaos-service rewrites all of
+        # it on its next start), so the DRM session isn't fought by a capture
+        # client whose OnFailure restarts phosh.
+        rm -f /etc/systemd/system/phosh.service.wants/kaos-ui-stream.service \
+              /etc/systemd/system/graphical.target.wants/kaos-ui-stream.service \
+              /etc/systemd/system/kaos-ui-stream.service \
+              /etc/systemd/system/kaos-ui-stream-recover.service
+        rmdir /etc/systemd/system/phosh.service.wants 2>/dev/null || true
+    fi
+}
+
+log "=== START ==="
+
+# Clear a stale overlay-mode marker from a prior kaos-service namespace
+# session against this same rootfs. kaos-service's ns-entry.sh (overlay/
+# namespace mode, never switch_root) touches /etc/kaos-overlay-active right
+# before exec'ing real systemd, so the cold-boot-only mount/init units
+# (ConditionPathExists=!/etc/kaos-overlay-active) skip themselves when run
+# inside an overlay namespace instead of fighting Android's already-running
+# droid-hal-init for the same HIDL/vendor-HAL registrations. This is a real
+# switch_root cold boot, so that marker (if left over from an earlier
+# overlay session against this same rootfs) must not survive to mask the
+# units this boot path actually needs.
+rm -f /etc/kaos-overlay-active 2>/dev/null || true
+
+refresh_nodes
+adapt_boot
+log "=== DONE ==="
+ls -la /dev/mapper/ > /dev/kmsg 2>&1 || true

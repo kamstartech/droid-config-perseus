@@ -3,6 +3,8 @@ Description=Droid mount for /vendor/firmware_mnt
 After=vendor.mount
 Requires=vendor.mount
 Before=local-fs.target
+# Cold-boot only: see system_root.mount / kaos-droid-hal-init.service.
+ConditionPathExists=!/etc/kaos-overlay-active
 
 [Mount]
 What=/dev/sde46

@@ -1,9 +1,9 @@
 [Unit]
 Description=Droid mount for /odm
 DefaultDependencies=no
-After=droid-mount-setup.service
-Requires=droid-mount-setup.service
 Before=local-fs.target systemd-modules-load.service
+# Cold-boot only: see system_root.mount / kaos-droid-hal-init.service.
+ConditionPathExists=!/etc/kaos-overlay-active
 
 [Mount]
 What=/run/droid/odm
