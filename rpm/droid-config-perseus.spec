@@ -10,6 +10,9 @@
 # Community HW adaptations need this
 %define community_adaptation 1
 
+# Android version for sparse overlay (selects sparse-15/ for fingerprint, keymint, etc.)
+%define android_version_major 15
+
 # Pixel ratio 1.0 was originally jolla phone with 245ppi, and the devices
 # should roughly have their ppi compared to that. Large displays can use
 # bigger ratio if seen fit. Values are with 0.25 increments.

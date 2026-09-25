@@ -1,6 +1,7 @@
 [Unit]
 Description=Kaos droid-hal-init (Android vendor HAL / WLAN bring-up)
-After=local-fs.target systemd-tmpfiles-setup.service
+After=local-fs.target systemd-tmpfiles-setup.service kaos-droid-hal-prepare.service
+Requires=kaos-droid-hal-prepare.service
 Before=graphical.target
 DefaultDependencies=no
 Conflicts=shutdown.target
@@ -10,6 +11,11 @@ ConditionPathExists=!/etc/kaos-overlay-active
 # guarantees they've completed -- the same idiom SailfishOS's own
 # droid-hal-init.service uses. Android init can only start once per boot --
 # if it dies, don't restart it.
+# Requires=/After=kaos-droid-hal-prepare.service: 2026-09-24, matching
+# SailfishOS's droid-hal-init.service (Requires=droid-hal-prepare.service).
+# All mounts/APEX-fallback/linkerconfig-restore/rc-patches/markers now live
+# in that oneshot unit and must fully finish first -- see
+# kaos-droid-hal-prepare.service and kaos-droid-hal-prepare.sh.
 # ConditionPathExists=!/etc/kaos-overlay-active: this unit is installed
 # rootfs-wide (WantedBy=graphical.target), and the SAME rootfs also gets
 # booted by kaos-service's overlay/namespace mode, where Android is already
@@ -24,11 +30,34 @@ ConditionPathExists=!/etc/kaos-overlay-active
 # unit during a real cold boot.
 
 [Service]
-Type=simple
+Type=notify
+NotifyAccess=all
+# 2026-09-24: was Type=simple. Matches droid-hal-init.service in
+# droid-hal-startup.sh (Type=notify, NotifyAccess=all). Six earlier,
+# individually-confirmed-correct config-CONTENT fixes (persist-restore,
+# real re-mount, real apexd activation, dir.system patch, /linkerconfig/
+# default population, HYBRIS_BUILD stub binary) each produced zero
+# measurable change to phoc's "not accessible for the namespace (default)"
+# EGL error. Under the old Type=simple, systemd considered this service (and
+# therefore graphical.target / phoc, which this unit is Before=) "started"
+# the instant the ExecStart process existed -- regardless of whether
+# droid-hal-init's own boot, real APEX activation, or HWComposer had reached
+# a consistent state yet. Type=notify now makes graphical.target genuinely
+# wait for kaos-droid-hal-init.sh's own HWComposer-readiness poll +
+# `systemd-notify --ready` call (see that script) before phoc can start at
+# all -- untested structural fix, replacing the walked-back HYBRIS_BUILD
+# stub-binary theory as the leading explanation.
 # Intentionally un-sandboxed: bind-mount-patches real vendor/system rc files
 # before exec'ing droid-hal-init.
 ExecStart=/bin/sh /usr/local/sbin/kaos-droid-hal-init.sh
-TimeoutSec=60
+# The script backgrounds droid-hal-init and stays running to orchestrate
+# real APEX activation (waiting for apexd, per-APEX linkerconfig
+# generation), poll for HWComposer readiness, send sd_notify READY, then
+# wait for droid-hal-init to exit -- the same shape SailfishOS's
+# droid-hal-startup.sh uses. Full WLAN bring-up alone has taken minutes in
+# prior testing this project (see kaos/SESSION_HANDOFF_2026-09-21.md's noted
+# ~17-19 min stall) -- TimeoutStartSec covers the whole run, not just setup.
+TimeoutStartSec=300
 
 [Install]
 WantedBy=graphical.target

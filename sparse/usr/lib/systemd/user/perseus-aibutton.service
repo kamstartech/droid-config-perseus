@@ -1,0 +1,12 @@
+[Unit]
+Description=Perseus AI button handler
+After=lipstick.service
+
+[Service]
+Type=simple
+ExecStart=/usr/libexec/perseus-aibutton-handler
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=user-session.target

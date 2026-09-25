@@ -1,0 +1,79 @@
+#!/usr/bin/python3
+"""Perseus AI button evdev handler.
+
+Listens on /dev/input/event3 (gpio-keys) for VOICE_ASSIST presses
+(keycode 0x2b1 / 689) and executes the command configured in:
+  /etc/default/perseus-aibutton  (system default)
+  ~/.config/perseus-aibutton.conf (per-user override)
+
+The override file uses the same COMMAND="..." shell-syntax.
+"""
+
+import os
+import select
+import struct
+import subprocess
+import sys
+
+EVDEV_PATH = "/dev/input/event3"
+KEY_VOICE_ASSIST = 0x2B1  # Android/Sailfish VOICE_ASSIST
+
+
+def parse_config(path):
+    """Return COMMAND value from a config file, or None."""
+    if not os.path.exists(path):
+        return None
+    with open(path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("COMMAND="):
+                val = line.split("=", 1)[1]
+                if (
+                    (val.startswith('"') and val.endswith('"'))
+                    or (val.startswith("'") and val.endswith("'"))
+                ):
+                    val = val[1:-1]
+                return val
+    return None
+
+
+def read_config():
+    cmd = parse_config("/etc/default/perseus-aibutton")
+    user_conf = os.path.expanduser("~/.config/perseus-aibutton.conf")
+    override = parse_config(user_conf)
+    if override is not None:
+        cmd = override
+    if cmd is None:
+        cmd = "/usr/libexec/perseus-aibutton-torch"
+    return cmd
+
+
+def read_event(fd):
+    """Read one 24-byte evdev input_event."""
+    data = os.read(fd, 24)
+    if len(data) < 24:
+        return None
+    sec, usec, typ, code, val = struct.unpack("llHHi", data)
+    return typ, code, val
+
+
+def main():
+    cmd = read_config()
+    fd = os.open(EVDEV_PATH, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        while True:
+            select.select([fd], [], [])
+            ev = read_event(fd)
+            if ev is None:
+                continue
+            typ, code, val = ev
+            if typ == 1 and code == KEY_VOICE_ASSIST and val == 1:
+                subprocess.run(["/bin/sh", "-c", cmd])
+    finally:
+        os.close(fd)
+
+
+if __name__ == "__main__":
+    main()

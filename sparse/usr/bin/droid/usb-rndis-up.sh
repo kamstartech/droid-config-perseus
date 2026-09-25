@@ -1,21 +1,49 @@
 #!/bin/sh
-# Force RNDIS USB developer mode on perseus, independent of usb-moded (TRD-007).
+# Fallback RNDIS bring-up for perseus — cable-gated, defers to usb-moded (TRD-007v2).
 #
-# In the switch_root cold-boot environment, usb-moded's MCE cable detection is
-# unreliable and it tries the wrong configfs function (rndis_bam.rndis) instead of
-# the SDM845 gsi.rndis, so developer mode never activates. The 10-usb-configfs.conf
-# drop-in builds the gadget *structure* (g1 + config b.1 + gsi.rndis function) but
-# never links the function into the config or binds the UDC, so nothing enumerates.
+# usb-moded now owns the gadget via its configfs backend (see
+# /etc/usb-moded/usb-moded-configfs-perseus.ini, function_rndis=gsi.rndis). This
+# script only exists as a safety net for the switch_root cold-boot case where
+# MCE/udev cable detection has historically been unreliable: if a cable is
+# physically present but usb-moded has not enumerated RNDIS within the grace
+# period, force the gadget so SSH access to the device is never lost.
 #
-# This service completes the gadget using the exact attributes the working Android
-# gadget uses (read from a live Android boot: gsi.rndis has no dev_addr/host_addr;
-# functions link as f1; os_desc b_vendor_code=0x1), binds the DWC3 UDC, brings up
-# rndis0 with the standard Jolla device IP, and serves DHCP to the host.
+# Crucially it does NOTHING when no cable is present — the old unconditional
+# UDC bind kept the USB PHY out of power collapse and drained the battery.
 G=/config/usb_gadget/g1
 UDCDEV=a600000.dwc3
 DEV_IP=192.168.2.15
+GRACE=45
 LOGF=/var/log/usb-rndis.log
 log() { echo "$(date '+%H:%M:%S') usb-rndis: $*" >> "$LOGF"; echo "usb-rndis: $*" > /dev/kmsg 2>/dev/null; }
+
+cable_present() {
+    # VBUS via power_supply; fall back to extcon if the node is absent.
+    ONL=$(cat /sys/class/power_supply/usb/online 2>/dev/null)
+    [ "$ONL" = "1" ] && return 0
+    grep -qs 'USB=1' /sys/class/extcon/extcon*/state 2>/dev/null && return 0
+    return 1
+}
+
+rndis_active() {
+    [ -d /sys/class/net/rndis0 ] || return 1
+    /usr/sbin/ip -4 addr show dev rndis0 2>/dev/null | grep -q 'inet ' || return 1
+    [ -s "$G/UDC" ] || return 1
+    return 0
+}
+
+# Grace period: give usb-moded (cable detect or rescue mode) time to do its job.
+i=0
+while [ $i -lt $GRACE ]; do
+    rndis_active && { log "usb-moded brought up rndis0 itself — fallback not needed"; exit 0; }
+    sleep 3; i=$((i+3))
+done
+
+if ! cable_present; then
+    log "no USB cable detected — leaving gadget unbound (power saving)"; exit 0
+fi
+
+log "cable present but RNDIS not active after ${GRACE}s — forcing gadget (usb-moded fallback)"
 
 i=0
 while [ ! -d /config/usb_gadget ] && [ $i -lt 30 ]; do sleep 1; i=$((i+1)); done
@@ -47,14 +75,10 @@ echo 0x1     > "$G/os_desc/b_vendor_code" 2>/dev/null
 echo MSFT100 > "$G/os_desc/qw_sign" 2>/dev/null
 [ -e "$G/os_desc/b.1" ] || ln -s "$G/configs/b.1" "$G/os_desc/b.1" 2>/dev/null
 
-# Bind to the DWC3 controller. Cold-boot: bind now, don't wait for a cable event.
-# Retry: the bind intermittently fails (boot 01:28) — usually because the config has
-# no function linked yet (kernel rejects an empty config with EINVAL) or the UDC is
-# transiently busy. Each attempt re-asserts the f1 link, clears the UDC, and rebinds.
+# Bind to the DWC3 controller, retrying transient EINVAL/busy failures.
 UDC=$(ls /sys/class/udc 2>/dev/null | grep -Fx "$UDCDEV" || ls /sys/class/udc 2>/dev/null | head -1)
 BOUND=0
 for attempt in 1 2 3 4 5; do
-    # Ensure the function is linked into the config before binding (empty config => EINVAL).
     [ -L "$G/configs/b.1/f1" ] || ln -s "$G/functions/gsi.rndis" "$G/configs/b.1/f1" 2>/dev/null
     echo "" > "$G/UDC" 2>/dev/null   # clear any stale/partial binding
     if echo "$UDC" > "$G/UDC" 2>/dev/null; then
@@ -78,10 +102,8 @@ fi
 /usr/sbin/ip link set rndis0 up
 log "rndis0 up at ${DEV_IP}/24"
 
-# Open the firewall for the dev RNDIS link. Disabling usb-moded removed the
-# developer_mode firewall opening, so incoming traffic on rndis0 (ICMP, SSH) is
-# otherwise dropped (ARP resolves but connections time out). Accept all input on
-# rndis0 so SSH to ${DEV_IP} works. Idempotent (check-then-insert).
+# Firewall: in fallback mode usb-moded's developer_mode firewall hooks never ran,
+# so open input on rndis0 (ICMP, SSH). Idempotent (check-then-insert).
 if [ -x /sbin/iptables ]; then
     /sbin/iptables -C INPUT -i rndis0 -j ACCEPT 2>/dev/null \
         || /sbin/iptables -I INPUT -i rndis0 -j ACCEPT 2>/dev/null

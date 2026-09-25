@@ -1,6 +1,8 @@
 [Unit]
 Description=Droid mount for /mnt/vendor/persist
 Before=local-fs.target
+# Cold-boot only: see system_root.mount / kaos-droid-hal-init.service.
+ConditionPathExists=!/etc/kaos-overlay-active
 
 [Mount]
 What=/dev/sda15

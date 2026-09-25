@@ -16,8 +16,9 @@ echo 7 > /proc/sys/kernel/printk 2>/dev/null && log "printk level set to 7 (debu
 mount -o remount,hidepid=0 /proc 2>/dev/null && log "Remounted /proc without hidepid" \
     || log "WARN: failed to remount /proc without hidepid"
 
-# droid-mount-setup.service mounts /dev tmpfs before this service starts.
-# We only need to ensure /dev/socket exists, then add hardware-specific nodes.
+# /dev is already a live devtmpfs by this point (trampoline mounts it fresh
+# pre-pivot, before kaos.init/systemd even start). We only need to ensure
+# /dev/socket exists, then add hardware-specific nodes.
 mkdir -p /dev/socket
 chmod 0755 /dev/socket
 chown root:root /dev/socket
@@ -130,6 +131,31 @@ touch /dev/.hybris_selinux_real 2>/dev/null \
 /system/bin/chcon u:object_r:hwbinder_device:s0 /dev/hwbinder 2>/dev/null || log "WARN: chcon /dev/hwbinder failed"
 /system/bin/chcon u:object_r:vndbinder_device:s0 /dev/vndbinder 2>/dev/null || log "WARN: chcon /dev/vndbinder failed"
 
+# Label droidmedia binaries and libraries so droid-hal-init can transition them
+# out of init:s0 into the proper media/surfaceflinger domains.  The libraries get
+# system_lib_file so every domain may map/execute them.
+for lib in \
+    /usr/libexec/droid-hybris/system/lib64/libdroidmedia.so \
+    /usr/libexec/droid-hybris/system/lib64/libminisf.so \
+    /usr/libexec/droid-hybris/system/lib64/libdroidmedia_binder_compat.so
+ do
+    [ -e "$lib" ] && \
+        /system/bin/chcon u:object_r:system_lib_file:s0 "$lib" 2>/dev/null && \
+        log "chcon $lib -> system_lib_file" || log "WARN: chcon $lib failed"
+done
+
+[ -x /usr/libexec/droid-hybris/system/bin/minimediaservice ] && \
+    /system/bin/chcon u:object_r:mediaserver_exec:s0 \
+        /usr/libexec/droid-hybris/system/bin/minimediaservice 2>/dev/null && \
+    log "chcon minimediaservice -> mediaserver_exec" || \
+    log "WARN: chcon minimediaservice failed"
+
+[ -x /usr/libexec/droid-hybris/system/bin/minisfservice ] && \
+    /system/bin/chcon u:object_r:surfaceflinger_exec:s0 \
+        /usr/libexec/droid-hybris/system/bin/minisfservice 2>/dev/null && \
+    log "chcon minisfservice -> surfaceflinger_exec" || \
+    log "WARN: chcon minisfservice failed"
+
 # Remove reboot_on_failure directives from Android init RC files.
 # We ensure the Sailfish root is RW as permitted, but /system remains read-only.
 mount -o remount,rw / 2>/dev/null
@@ -187,6 +213,33 @@ patch_rc_display_hal() {
     mount --bind "$tmp" "$orig" && log "Patched $(basename $orig): display HAL hybris fixes" \
         || log "WARN: failed to bind-mount display HAL patch for $orig"
 }
+
+# TRD-037: declare HIDL fingerprint@2.1 in the device VINTF manifest.
+# LineageOS 22.2 only declares the AIDL IFingerprint (which
+# sailfish-fpd-community cannot talk to). hwservicemanager enforces VINTF
+# declarations server-side and caches the manifest at startup, so this
+# bind-mount must happen here — before droid-hal-init spawns it. The SFOS
+# fingerprint bridge (fingerprint-2-1 service) then registers successfully.
+# Android mode is untouched: bind mounts do not survive into normal boots.
+patch_vintf_manifest_fp21() {
+    local orig=/vendor/etc/vintf/manifest.xml
+    [ -f "$orig" ] || return 0
+    if grep -qF '2.1::IBiometricsFingerprint' "$orig"; then
+        log "VINTF manifest already declares fingerprint@2.1"
+        return 0
+    fi
+    local tmp
+    tmp=$(mktemp -t vintf-manifest.XXXXXX) || return 1
+    sed 's#</manifest>#    <hal format="hidl">\n        <name>android.hardware.biometrics.fingerprint</name>\n        <transport>hwbinder</transport>\n        <fqname>@2.1::IBiometricsFingerprint/default</fqname>\n    </hal>\n</manifest>#' "$orig" > "$tmp"
+    # CRITICAL: mktemp creates 0600 — hwservicemanager runs as user system and
+    # must be able to READ the manifest, or it rejects EVERY HIDL registration
+    # (composer included → black screen). The rc-patch functions above get away
+    # with 0600 because droid-hal-init reads those as root.
+    chmod 0644 "$tmp"
+    mount --bind "$tmp" "$orig" && log "Patched vintf manifest: declared fingerprint@2.1" \
+        || log "WARN: failed to bind-mount vintf manifest patch"
+}
+patch_vintf_manifest_fp21
 
 patch_rc_no_reboot /system/etc/init/vold.rc
 # NOTE: patch_rc_disable_service is defined later in this script (after line 362).
@@ -465,12 +518,15 @@ mkdir -p /linkerconfig
 log "linkerconfig: bootstrap patched in early-init — will re-mount after SetupMountNamespaces"
 
 # Ensure /data exists for HAL services that expect Android data paths.
+# droid-hal-early-init.sh now mounts the real Android userdata partition on
+# /data so that apexd can decompress APEXes into /data/apex/decompressed/.
+# If for some reason that mount did not happen, fall back to a small tmpfs so
+# the modem and property setup below still has a target.
 # TRD-010: qcrild and droid-hal-init need Android /data/property (persist
-# properties) and /data/vendor/modem_config. The Sailfish rootfs lives on the
-# userdata partition, and after switch_root the original Android /data directory
-# is no longer visible. Android /data is also FBE-encrypted, so it cannot simply
-# be bind-mounted. We keep a tmpfs /data and populate the specific files that
-# the modem stack needs from the firmware partition and a pre-captured snapshot.
+# properties) and /data/vendor/modem_config. Android /data/data is
+# FBE-encrypted, so it remains inaccessible; we populate the specific files
+# that the modem stack needs from the firmware partition and a pre-captured
+# snapshot.
 if ! mountpoint -q /data 2>/dev/null; then
     mkdir -p /data
     mount -t tmpfs -o mode=0755,size=64m tmpfs /data && log "Mounted tmpfs on /data"
@@ -586,14 +642,22 @@ fi
 # have different build IDs and libbinder's runtime header check aborts IPC
 # transactions with "Mixing copies of libbinder". Force every process in the
 # Android container to use the vendor copy by bind-mounting it over the system
-# path. This is safe because the vendor variant is a superset of the system ABI.
+# and hybris paths. This is safe because the vendor variant is now a superset
+# of the system ABI (whole_static_libs pull in PermissionCache, PermissionController,
+# etc., so vendor libbinder exports everything system libbinder does).
 for libdir in lib lib64; do
     sys="/system/${libdir}/libbinder.so"
+    hyb="/usr/libexec/droid-hybris/system/${libdir}/libbinder.so"
     ven="/vendor/${libdir}/libbinder.so"
     if [ -f "$sys" ] && [ -f "$ven" ]; then
         mount --bind "$ven" "$sys" 2>/dev/null \
             && log "TRD-018: bound $ven -> $sys" \
             || log "WARN: failed to bind $ven -> $sys"
+    fi
+    if [ -f "$hyb" ] && [ -f "$ven" ]; then
+        mount --bind "$ven" "$hyb" 2>/dev/null \
+            && log "TRD-018: bound $ven -> $hyb" \
+            || log "WARN: failed to bind $ven -> $hyb"
     fi
 done
 
@@ -605,6 +669,16 @@ for fw in a630_sqe.fw a630_gmu.bin a630_zap.mdt a630_zap.b00 a630_zap.b01 a630_z
     [ -f "$src" ] && ln -sf "$src" "/lib/firmware/$fw" 2>/dev/null
 done
 log "GPU firmware: $(ls /lib/firmware/a630* 2>/dev/null | wc -l) a630 files linked"
+
+# Hybris Q linker searches /usr/libexec/droid-hybris/system/lib64 first (hardcoded default).
+# libandroidicu.so lives only in /apex/com.android.i18n/lib64 — not in the default path.
+# Symlink it here so android_dlopen("libdroidmedia.so") can resolve it as a transitive dep
+# without HYBRIS_LD_LIBRARY_PATH being set inside the sailjail camera sandbox.
+# The symlink target may not exist yet at this point (apexd hasn't run), but it will exist
+# by the time jolla-camera calls android_dlopen after APEX activation.
+ln -sf /apex/com.android.i18n/lib64/libandroidicu.so /usr/libexec/droid-hybris/system/lib64/libandroidicu.so 2>/dev/null \
+    && log "Symlinked libandroidicu.so (i18n APEX) into hybris lib64" \
+    || log "WARN: libandroidicu.so symlink into hybris lib64 failed"
 
 # TAS2557 smart-amp DSP firmware (loudspeaker PA): NOT symlinked here. The kernel
 # requests tas2557_uCDSP.bin at i2c coldplug — far earlier than this script and before
@@ -722,6 +796,32 @@ patch_build_prop_property_version() {
 }
 patch_build_prop_property_version
 
+# Race apexd to bind-mount a pre-built mediaswcodec.32rc (with stdio_to_kmsg)
+# over the real APEX file before droid-hal-init parses it.  The pre-built copy
+# is created in droid-hal-early-init.sh at /run/hybris-mediaswcodec-etc/
+# mediaswcodec.32rc; this function only polls and bind-mounts so the critical
+# path inside the ~73ms race window is as short as possible.
+patch_mediaswcodec_rc_kmsg() {
+    local orig=/apex/com.android.media.swcodec/etc/mediaswcodec.32rc
+    local patched=/run/hybris-mediaswcodec-etc/mediaswcodec.32rc
+    local i=0
+    while [ $i -lt 1000 ] && [ ! -f "$orig" ]; do
+        i=$((i + 1))
+        sleep 0.01
+    done
+    if [ ! -f "$orig" ]; then
+        log "WARN: $orig never appeared, stdio_to_kmsg RC patch not applied"
+        return 1
+    fi
+    if [ ! -f "$patched" ]; then
+        log "WARN: pre-built patched RC $patched missing, stdio_to_kmsg RC patch not applied"
+        return 1
+    fi
+    mount --bind "$patched" "$orig" \
+        && log "Patched $orig: bind-mounted pre-built stdio_to_kmsg RC (racer)" \
+        || log "WARN: failed to bind-mount $orig patch"
+}
+
 log "Starting droid-hal-init (HWComposer mode)..."
 # Run droid-hal-init in the same mount namespace as this service. APEX mounts
 # made by apexd will then be visible to the startup script, allowing setprop,
@@ -730,6 +830,10 @@ log "Starting droid-hal-init (HWComposer mode)..."
 /sbin/droid-hal-init >> $LOGF 2>&1 &
 INIT_PID=$!
 log "droid-hal-init PID=$INIT_PID"
+
+# Race apexd to patch mediaswcodec.32rc before droid-hal-init parses it.
+# The pre-built patched copy lives in /run/ (created by droid-hal-early-init.sh).
+patch_mediaswcodec_rc_kmsg &
 
 # Wait for hwservicemanager process to be running before qcrild starts.
 # lshal is unusable here — SELinux denies service_manager find in u:r:init:s0
@@ -777,6 +881,20 @@ else
     log "WARN: apex-post-setup.sh not found"
 fi
 
+# Keep the libhybris copy of libdl.so in sync with the runtime APEX.
+# The Sailfish rootfs carries a static copy that can drift behind the APEX
+# (e.g. HYBRIS_BUILD CFI fixes). Bind-mount the APEX version over the hybris
+# path so glibc-side Android loads always use the same libdl.so as the APEX.
+for libdir in lib lib64; do
+    runtime="/apex/com.android.runtime/${libdir}/bionic/libdl.so"
+    hyb="/usr/libexec/droid-hybris/system/${libdir}/libdl.so"
+    if [ -f "$runtime" ] && [ -f "$hyb" ]; then
+        mount --bind "$runtime" "$hyb" 2>/dev/null \
+            && log "Bound $runtime -> $hyb" \
+            || log "WARN: failed to bind $runtime -> $hyb"
+    fi
+done
+
 # Wait for droid-hal-init's SetupMountNamespaces to replace /linkerconfig with a
 # fresh tmpfs. Detect it via /proc/mounts — the moment tmpfs appears on /linkerconfig
 # the early-init bind-mount (bootstrap) is buried and we can re-mount our patched copy.
@@ -799,6 +917,47 @@ mount --bind /run/droid-linkerconfig.txt "$LIVE_LDCFG" \
     && log "linkerconfig: re-mounted from /run/ ($(wc -l < /run/droid-linkerconfig.txt) lines)" \
     || log "WARN: failed to re-mount linkerconfig from /run/ — vendor HALs may fail"
 
+# ANDROID 15 APEX PER-MODULE LINKERCONFIG
+# /linkerconfig/ld.config.txt patched above is the global namespace config.
+# APEX binaries (e.g. /apex/com.android.media.swcodec/bin/mediaswcodec) also need
+# /linkerconfig/<apex>/ld.config.txt containing their own namespace section.
+# init's DoLoadApex() is supposed to generate these via the real linkerconfig,
+# but in the hybris environment the per-APEX configs are often missing, causing
+# mediaswcodec to abort with linker errors. Generate them explicitly here, after
+# SetupMountNamespaces has created the live /linkerconfig tmpfs and after apexd
+# has activated the runtime APEX (apex-post-setup.sh already waited for it).
+generate_apex_linkerconfigs() {
+    local real=/apex/com.android.runtime/bin/linkerconfig
+    [ -x "$real" ] || {
+        log "linkerconfig: real linkerconfig not available, skipping per-APEX generation"
+        return 0
+    }
+    local apex_name apex_bin apex_path generated=0
+    for apex_bin in /apex/com.*/bin; do
+        [ -d "$apex_bin" ] || continue
+        apex_path=$(dirname "$apex_bin")
+        apex_name=$(basename "$apex_path")
+        # The runtime APEX only provides the linkerconfig binary; it does not
+        # need a per-APEX config for itself.
+        [ "$apex_name" = "com.android.runtime" ] && continue
+        # apexd mounts both /apex/<name> and /apex/<name>@<version>.
+        # Only process the active (non-versioned) path; the versioned path
+        # has the same module name and would cause "not found" errors.
+        case "$apex_name" in
+            *@*) continue ;;
+        esac
+        if "$real" --target /linkerconfig --apex "$apex_name" --strict >> "$LOGF" 2>&1; then
+            log "linkerconfig: generated per-APEX config for $apex_name"
+            generated=$((generated + 1))
+        else
+            log "WARN: linkerconfig failed to generate config for $apex_name"
+        fi
+    done
+    log "linkerconfig: generated $generated per-APEX config(s)"
+}
+
+generate_apex_linkerconfigs
+
 # Wait for Android property service, then for vendor RC files to be parsed.
 # SetupMountNamespaces fires BEFORE RC parsing in Android 15 init's sequence.
 # We must wait for property_service to come up before getprop is meaningful,
@@ -819,7 +978,23 @@ log "vendor RC parse window elapsed — proceeding"
 # Explicitly start HAL services that were disabled by class_start main removal.
 # Audio, vibrator, radio and WiFi/BT are in class main/late_start/hal, so they don't auto-start.
 # minimedia (class main) registers media.audio_policy and media.camera.
-for svc in vendor.nv_mac vendor.cnss-daemon vendor.qti.vibrator vendor.qcrild vendor.qcrild2 vendor.adsprpcd minimedia; do
+# minisf (class main) registers the SurfaceFlinger binder service needed by camera/libgui.
+# Both are re-enabled: current droidmedia's MiniSurfaceFlinger is a fake binder service
+# (android.gui.ISurfaceComposer) and does not grab HWComposer from lipstick.
+
+# minimediaservice needs /data/misc/camera to exist with the right owner before it
+# starts, otherwise media.camera never registers. Android normally creates this via
+# init.rc post-fs-data, but that step does not run in the hybris namespace.
+# The writable overlay is mounted in droid-hal-early-init.sh before droid-hal-init
+# parses vendor RC files, so /data/misc/camera is already available here.
+mkdir -p /data/misc/camera
+chmod 0771 /data/misc/camera
+chown system:camera /data/misc/camera
+log "Ensured /data/misc/camera exists (system:camera 0771)"
+
+# vendor.media.omx provides the HIDL OMX store that gmp-generate-info.sh
+# (Gecko Media Plugin enumeration) blocks on forever if unavailable.
+for svc in vendor.nv_mac vendor.cnss-daemon vendor.qti.vibrator vendor.qcrild vendor.qcrild2 vendor.adsprpcd media.swcodec vendor.media.omx minimedia minisf; do
     if [ -x /system/bin/setprop ]; then
         /system/bin/setprop ctl.start "$svc" 2>/dev/null && log "Started $svc via setprop"
     elif [ -x /vendor/bin/setprop ]; then
@@ -881,18 +1056,22 @@ for node in binder_guest hwbinder_guest vndbinder_guest; do
 done
 log "binder_guest device permissions: $(ls -la /dev/binder_guest /dev/hwbinder_guest /dev/vndbinder_guest 2>/dev/null | awk '{print $1,$3,$4,$NF}' | tr '\n' ' ' || echo 'nodes not found')"
 
-# Notify systemd that droid-hal-init and HWComposer are up. ADSP audio is NOT
-# included in the READY gate — PulseAudio is gated separately via a drop-in
-# (50-adsp-wait.conf ExecStartPre) that blocks PA until t=120s when APR is ready.
-# All other services (lipstick, ofono, sensorfwd) start immediately.
-systemd-notify --ready 2>/dev/null && log "Sent sd_notify READY (HWComposer up, droid-card loaded via droid-card-delayed.service)"
+# Notify systemd that droid-hal-init and HWComposer are up. ADSP audio readiness
+# is NOT included in this READY gate; PulseAudio is gated separately via
+# /etc/systemd/user/pulseaudio.service.d/50-adsp-wait.conf, which polls
+# /proc/asound/card0/cpe0_state until ONLINE before starting PA. All other
+# services (lipstick, ofono, sensorfwd) start immediately.
+systemd-notify --ready 2>/dev/null && log "Sent sd_notify READY (HWComposer up)"
 
 # TAS2557 SmartPA boot-recovery:
-# PA starts at t=120s; module-droid-card is loaded from droid.pa at PA startup.
-# The first tas2557_enable() fires at t=~121s: firmware not loaded → safe-guard failure
-# → I2C chip restart → firmware reloads → fw_ready power-up with s1_0 config.
-# The chip needs ~14s to settle after GPIO reset. We fire at t=136s (absolute
-# uptime) to do a full PowerCtrl cycle with the correct s3_6 config.
+# With PA now gated on CPE ONLINE rather than a fixed t=120s, module-droid-card
+# loads and the first tas2557_enable() fires soon after (~58s observed on warm
+# boots). The first enable can hit firmware-not-loaded safe-guard failure,
+# causing an I2C chip restart and fw_ready power-up with the s1_0 tuning profile.
+# The chip needs ~14s to settle after that GPIO reset. We re-run the full
+# PowerCtrl cycle at absolute uptime 136s to force the correct s3_6 config with
+# calibration data loaded. If audio is verified working before this point on a
+# fresh boot, this absolute target can be moved earlier.
 # PowerCtrl=0 → mbPowerUp=false; Configuration=10 (s3_6); PowerCtrl=1 → full
 # startup+unmute sequence with calibration data loaded. Without this the speaker
 # uses the s1_0 tuning-mode profile which produces no audio output.

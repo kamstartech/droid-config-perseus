@@ -1,0 +1,32 @@
+#!/bin/sh
+# Perseus override of the sparse-15 wait_for_keymint template (TODO-11 / TRD-037).
+#
+# The stock template polls /dev/binder for the KeyMint AIDL service, but perseus'
+# vendor partition is Android 10-era Qualcomm: it serves keymaster@4.0 over
+# hwbinder and no IKeyMintDevice ever appears, so the template loops forever —
+# blocking multi-user.target and waking the CPU every second.
+#
+# sailfish-fpd actually needs the fingerprint HAL, so gate on that directly:
+# the Goodix vendor service registers android.hardware.biometrics.fingerprint@2.1
+# on /dev/hwbinder once droid-hal-init has brought it up. Bounded timeout so a
+# missing/broken HAL degrades to "fingerprint unavailable", never a boot hang.
+
+TIMEOUT=120
+GETPROP=$(command -v getprop || echo /usr/libexec/droid-hybris/system/bin/getprop)
+
+# NOTE: binder-list (libgbinder) cannot see this registration on Android 15 —
+# gate on the droid-hal-init service state instead (fingerprint-2-1 is the
+# SFOS HIDL bridge from fingerprint21-perseus.rc; it exits non-zero if
+# registration fails, so "running" implies registered).
+i=0
+while [ $i -lt $TIMEOUT ]; do
+    if [ "$($GETPROP init.svc.fingerprint-2-1 2>/dev/null)" = "running" ]; then
+        echo "Fingerprint HAL bridge running after ${i}s"
+        exit 0
+    fi
+    [ $((i % 10)) -eq 0 ] && echo "Waiting for fingerprint HAL (${i}/${TIMEOUT}s)"
+    sleep 1; i=$((i+1))
+done
+
+echo "WARN: fingerprint HAL not registered after ${TIMEOUT}s — continuing without it"
+exit 0

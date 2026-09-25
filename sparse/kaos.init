@@ -153,6 +153,70 @@ adapt_boot() {
             fi
         fi
 
+        # /dev/input/eventN nodes are still owned by the numeric gid Android's
+        # own ueventd assigned them at devtmpfs creation time (AID_INPUT=1004)
+        # -- this rootfs's own /etc/group is a completely separate table from
+        # Android's AID list and happened to assign the NAME "input" to a
+        # different NUMBER (995, Debian's own convention). Adding uid 1000 to
+        # that gid-995 "input" group (tried first, 2026-09-24) had zero effect
+        # for exactly this reason: the kernel DAC check compares the
+        # process's supplementary gid NUMBERS against the inode's gid NUMBER,
+        # and 995 never matched the 1004 actually on the node -- confirmed via
+        # `stat -c %g /dev/input/event0` = 1004 vs this rootfs's own
+        # `getent group input` = ...:995:..., plus a dmesg capture that same
+        # boot showing no SELinux avc denial for chr_file/input at all (ruled
+        # that out as a possible cause first).
+        # SailfishOS's own /etc/group (checked directly, same device) doesn't
+        # work around this with a chmod or an ACL -- it just renumbers the
+        # groups that gate Android-inherited /dev nodes to match Android's
+        # own AID table exactly: input:x:1004:defaultuser,
+        # audio:x:1005:pulse,defaultuser, camera:x:1006:defaultuser (video
+        # stays at Debian's own 44 there too -- /dev/dri isn't Android-AID-
+        # numbered the same way, so this treatment is only for the groups
+        # that actually need to match an Android-created node's gid).
+        # Matching that exactly, not inventing a different mechanism.
+        align_android_gid() {
+            # $1 = group name Android uses (also this rootfs's own name for
+            # it, when one already exists), $2 = Android's AID_* gid number.
+            _name="$1"; _gid="$2"
+            _u=$(getent passwd 1000 2>/dev/null | cut -d: -f1)
+            [ -n "$_u" ] || return 0
+            _existing_by_name=$(getent group "$_name" 2>/dev/null | cut -d: -f3)
+            _existing_by_gid=$(getent group "$_gid" 2>/dev/null | cut -d: -f1)
+            if [ -n "$_existing_by_gid" ]; then
+                # A group already sits on this exact gid (possibly $_name
+                # itself, already correct from a prior boot) -- just ensure
+                # membership.
+                if ! id -nG "$_u" 2>/dev/null | grep -qw "$_existing_by_gid"; then
+                    { usermod -aG "$_existing_by_gid" "$_u" 2>/dev/null || \
+                      gpasswd -a "$_u" "$_existing_by_gid" >/dev/null 2>&1; } && \
+                        log "boot: added $_u to $_existing_by_gid (gid $_gid)"
+                fi
+            elif [ -n "$_existing_by_name" ]; then
+                # $_name exists but under Debian's own (wrong) gid -- renumber
+                # it, same as SailfishOS's own table has it. groupmod only
+                # changes the /etc/group entry, not any filesystem owner --
+                # nothing on this rootfs is owned by the old gid, so there's
+                # nothing to chown.
+                groupmod -g "$_gid" "$_name" 2>/dev/null && \
+                    log "boot: renumbered $_name group $_existing_by_name -> $_gid (matches Android AID)"
+                if ! id -nG "$_u" 2>/dev/null | grep -qw "$_name"; then
+                    { usermod -aG "$_name" "$_u" 2>/dev/null || gpasswd -a "$_u" "$_name" >/dev/null 2>&1; } && \
+                        log "boot: added $_u to $_name (gid $_gid)"
+                fi
+            else
+                # Doesn't exist at all under either name or gid (e.g. this
+                # rootfs has no 'camera' group by default) -- create it.
+                groupadd -g "$_gid" "$_name" 2>/dev/null && \
+                    log "boot: created $_name group at gid $_gid (matches Android AID)"
+                { usermod -aG "$_name" "$_u" 2>/dev/null || gpasswd -a "$_u" "$_name" >/dev/null 2>&1; } && \
+                    log "boot: added $_u to $_name (gid $_gid)"
+            fi
+        }
+        align_android_gid input 1004
+        align_android_gid audio 1005
+        align_android_gid camera 1006
+
         mkdir -p /etc/systemd/system/graphical.target.wants
         if [ ! -e /etc/systemd/system/graphical.target.wants/phosh.service ]; then
             ln -sf /usr/lib/systemd/system/phosh.service \
@@ -168,6 +232,70 @@ adapt_boot() {
             echo 'After=systemd-logind.service'
             echo 'Wants=systemd-logind.service'
             echo '[Service]'
+            # TEMPORARY DIAGNOSTIC (2026-09-25, remove once the SIGSEGV below
+            # is root-caused): the base unit's own ExecStart
+            # (capsh --noamb -- -c "exec /usr/bin/phosh-session") execs
+            # through phosh-session before reaching phoc, and cold-boot has
+            # no adb access at all once switch_root replaces Android's own
+            # userspace (adbd goes with it) -- there is no way to attach a
+            # live debugger mid-boot the way overlay mode's own SSH access
+            # allowed. Overlay mode's manual reproduction already confirmed
+            # running plain /usr/bin/phoc directly (no phosh-session/capsh)
+            # reproduces the identical SIGSEGV, so this bypasses the wrapper
+            # chain and runs phoc under gdb in batch mode instead: it starts
+            # phoc, catches the SIGSEGV when it happens, and dumps a full
+            # backtrace (all threads) into the same StandardOutput log file
+            # below, readable via adb once the device bounces back to
+            # Android. No live interaction needed. Clear the base unit's own
+            # ExecStart first (a bare "ExecStart=" line does this in a
+            # drop-in) before setting this replacement.
+            #
+            # REVISED 2026-09-25 after the first attempt's own result: running
+            # plain /usr/bin/phoc directly under gdb (bypassing phosh-session/
+            # capsh entirely, as below) did NOT reproduce the crash at all --
+            # it ran cleanly the whole boot with no SIGSEGV. So the crash is
+            # specifically triggered by something in the phosh-session/
+            # gnome-session wrapping layer, not phoc in isolation (this
+            # contradicts what overlay mode's OWN manual reproduction showed,
+            # but that was a different renderer path -- Mesa/Zink, not
+            # hwcomposer -- so evidently a different bug). Wrapping the WHOLE
+            # chain in one gdb invocation isn't reliable either: phosh-
+            # session forks through several intermediate children (dbus,
+            # keyring, autostart helpers, gnome-session-binary) before phoc
+            # exists at all, and gdb's own fork-following is fragile with
+            # that many unrelated children. Instead: start the REAL chain
+            # exactly as production does (capsh included, for fidelity),
+            # poll for a process literally named "phoc" by name, and attach
+            # gdb fresh the moment it exists -- sidesteps fork-following
+            # entirely.
+            mkdir -p /usr/local/bin
+            cat > /usr/local/bin/kaos-phoc-gdb-catch.sh <<'GDBEOF'
+#!/bin/sh
+capsh --noamb -- -c "exec /usr/bin/phosh-session" &
+SESSION_PID=$!
+for _i in $(seq 1 200); do
+    PHOC_PID=$(pgrep -x phoc 2>/dev/null | head -n1)
+    [ -n "$PHOC_PID" ] && break
+    sleep 0.2
+done
+if [ -n "$PHOC_PID" ]; then
+    echo "kaos-phoc-gdb-catch: attaching gdb to phoc pid $PHOC_PID"
+    export DEBUGINFOD_URLS="https://debuginfod.ubuntu.com"
+    gdb -p "$PHOC_PID" -batch \
+        -iex "set debuginfod enabled on" \
+        -ex "handle SIGSEGV stop print" \
+        -ex continue \
+        -ex "bt full" \
+        -ex "thread apply all bt" \
+        -ex quit
+else
+    echo "kaos-phoc-gdb-catch: phoc never appeared after 40s"
+fi
+wait "$SESSION_PID"
+GDBEOF
+            chmod +x /usr/local/bin/kaos-phoc-gdb-catch.sh
+            echo 'ExecStart='
+            echo 'ExecStart=/usr/local/bin/kaos-phoc-gdb-catch.sh'
             # Confirmed live: phoc crashes (first attempt SIGBUS, every
             # restart after that a clean exit 1) with zero captured output
             # under any journal tag, despite WLR_LOG=debug below and
@@ -176,22 +304,87 @@ adapt_boot() {
             # path. Force it to a real file so the buffering doesn't matter.
             echo 'StandardOutput=append:/var/log/kaos-phoc-debug.log'
             echo 'StandardError=append:/var/log/kaos-phoc-debug.log'
-            # Keep this env identical to the overlay drop-in (kaos-service),
-            # except WLR_BACKENDS -- it is the proven-working KGSL/Mesa/zink
-            # setup. The missing VK_ICD_FILENAMES was what made zink fail here
-            # ("DRI2: failed to load driver" -> EGL_NOT_INITIALIZED).
-            echo 'Environment=WLR_BACKENDS=drm,libinput'
+            # Enable real core dumps for this service specifically.
+            # Confirmed live 2026-09-24: after the surfaceflinger/disabled-
+            # services fix, phoc now reaches "Enabling shell mode" cleanly
+            # and runs for ~25s before dying with a genuine SIGSEGV every
+            # single restart, with zero log output pointing at why (unlike
+            # the earlier native-window bug, which had explicit CRITICAL
+            # lines first). ulimit -c defaults to 0 for systemd services
+            # (ResourceLimits default), so systemd's own "code=dumped"
+            # result label does NOT mean an actual core file exists --
+            # confirmed by checking /var/lib/systemd/coredump/ (empty) and
+            # ~defaultuser/core (kernel.core_pattern="core", i.e. cwd) after
+            # an earlier SIGSEGV-generating boot, neither had anything.
+            # LimitCORE=infinity plus a deterministic core_pattern (set in
+            # kaos-droid-hal-prepare.sh, before this service ever starts)
+            # gives the next crash somewhere to actually land, so a real
+            # backtrace (gdb) becomes possible instead of guessing blind.
+            echo 'LimitCORE=infinity'
+            # Switched 2026-09-24 from the DRM/KGSL/Mesa/zink path (the
+            # comment this replaced called it "proven-working" -- it wasn't:
+            # phoc's swapchain allocation against the DRM render node always
+            # failed, root-caused this session to a genuine missing
+            # KGSL<->DRM interop bridge that never existed in this tree --
+            # see kaos/SESSION_HANDOFF_2026-09-23.md). The hwcomposer
+            # backend (our wlroots-hwcomposer fork, hybris/mw/wlroots-
+            # hwcomposer) renders through the real Android HWComposer HIDL
+            # service via libhybris instead, the same approach SailfishOS's
+            # lipstick already uses successfully on this device
+            # (EGL_PLATFORM=hwcomposer). No DRM/GBM/Mesa/Vulkan env needed --
+            # this backend never touches /dev/dri at all.
+            echo 'Environment=WLR_BACKENDS=hwcomposer,libinput'
             echo 'Environment=WLR_LOG=debug'
             echo 'Environment=PHOC_DEBUG=auto-maximize'
             echo 'Environment=WLR_RENDERER=gles2'
-            echo "Environment=WLR_RENDER_DRM_DEVICE=$DEV_DRM_RENDER"
-            echo 'Environment=WLR_DRM_NO_MODIFIERS=1'
-            echo 'Environment=MESA_LOADER_DRIVER_OVERRIDE=zink'
-            echo "Environment=LD_LIBRARY_PATH=$DEV_MESA_KGSL/lib:$DEV_MESA_KGSL/lib/dri"
-            echo "Environment=MESA_DRIVERS_PATH=$DEV_MESA_KGSL/lib/dri"
-            echo "Environment=LIBGL_DRIVERS_PATH=$DEV_MESA_KGSL/lib/dri"
-            echo "Environment=GBM_BACKENDS_PATH=$DEV_MESA_KGSL/lib/gbm"
-            echo "Environment=VK_ICD_FILENAMES=$DEV_MESA_KGSL/share/vulkan/icd.d/freedreno_icd.json"
+            echo 'Environment=EGL_PLATFORM=hwcomposer'
+            # HYBRIS_USE_VENDOR_NAMESPACE: root-caused 2026-09-24, after the
+            # Type=notify/HWComposer-poll structural fix (matching Sailfish's
+            # droid-hal-startup.sh) STILL produced the identical
+            # "not accessible for the namespace (default)" error for
+            # /vendor/lib64/egl/libGLESv2_adreno.so, proving every earlier
+            # fix (persist-restore, real re-mount, real apexd activation,
+            # dir.system patch, /linkerconfig/default population,
+            # HYBRIS_BUILD stub binary, Type=notify sequencing) was correct
+            # on its own terms but irrelevant to the actual failure.
+            # Traced into libhybris source (hybris/mw/libhybris/libhybris/
+            # hybris/common/q/linker_main.cpp get_executable_path(),
+            # DISABLED_FOR_HYBRIS_SUPPORT branch): this device's SDK version
+            # (35) selects the "q" linker backend (hybris/common/hooks.c
+            # __hybris_linker_init(), sdk_version<=29 threshold, q is the
+            # newest/default backend for anything newer). That backend does
+            # NOT use /proc/self/exe for its own self-identity when matching
+            # dir.system/dir.vendor rules in ld.config.txt -- it's hardcoded
+            # to always claim to be /system/bin/app_process64 (the classic
+            # Halium-era "pretend to be zygote" trick), UNLESS this exact
+            # env var is set, in which case it claims /vendor/bin/yes
+            # instead. Confirmed by diffing the real, persisted, genuine
+            # Android-15-generated /mnt/vendor/persist/ld.config.txt: the
+            # [system] section's own namespace.default (what app_process64
+            # resolves into, isolated=true) has NO /vendor/${LIB}/egl in its
+            # search or permitted paths at all -- modern Treble intentionally
+            # keeps ordinary system-partition processes away from vendor GPU
+            # driver internals. The [vendor] section's own namespace.default
+            # explicitly has search.paths += /vendor/${LIB}/egl and
+            # permitted.paths += /vendor -- exactly what libGLESv2_adreno.so
+            # needs, and exactly what SailfishOS's own lipstick presumably
+            # gets for free by a different route. Every prior fix targeted
+            # droid-hal-init's OWN real linkerconfig generation, which was
+            # never wrong -- phoc was reading that real, correctly-generated
+            # file the whole time, just being classified into the wrong
+            # (system, not vendor) section of it by libhybris's own
+            # hardcoded self-impersonation, independent of anything
+            # droid-hal-init does.
+            echo 'Environment=HYBRIS_USE_VENDOR_NAMESPACE=1'
+            # libhybris's own libEGL.so/libGLESv2.so live in /usr/lib/hybris,
+            # deliberately isolated from apt's Mesa EGL/GLESv2 (same SONAME,
+            # incompatible implementations -- Mesa's libEGL doesn't know
+            # EGL_PLATFORM=hwcomposer and falls back to trying X11).
+            # Confirmed live 2026-09-24: without this, phoc loaded Mesa's
+            # libEGL and failed with "invalid EGL_PLATFORM given" ->
+            # "xcb_connect failed". This is what actually decides which one
+            # wins for phoc, not ldconfig's default search order.
+            echo 'Environment=LD_LIBRARY_PATH=/usr/lib/hybris'
             # Seat: no seatd is installed and logind has no real VT here, so
             # phoc cannot acquire a seat on its own. Use the same
             # kaos-libseat-fake shim as the overlay path; it hands wlroots the
@@ -208,16 +401,20 @@ adapt_boot() {
             echo '[core]'
             echo 'xwayland=false'
             echo
-            echo '[output:DSI-1]'
+            # wlroots' hwcomposer backend names its (only) output
+            # "HWCOMPOSER-<display+1>" (backend/hwcomposer/output.c) -- not
+            # a DRM/KMS connector name like "DSI-1", which was specific to
+            # the DRM backend this replaced.
+            echo '[output:HWCOMPOSER-1]'
             echo "mode = $DEV_DISPLAY_SIZE"
             echo 'scale = 2'
         } > /etc/phosh/phoc.ini
-        log "boot: wrote phoc.ini (DSI-1 $DEV_DISPLAY_SIZE)"
+        log "boot: wrote phoc.ini (HWCOMPOSER-1 $DEV_DISPLAY_SIZE)"
 
-        # Cold boot uses DRM, not the overlay frame relay. Drop any relay
-        # wiring left by a previous warm start (kaos-service rewrites all of
-        # it on its next start), so the DRM session isn't fought by a capture
-        # client whose OnFailure restarts phosh.
+        # Cold boot uses the hwcomposer backend, not the overlay frame relay.
+        # Drop any relay wiring left by a previous warm start (kaos-service
+        # rewrites all of it on its next start), so this session isn't
+        # fought by a capture client whose OnFailure restarts phosh.
         rm -f /etc/systemd/system/phosh.service.wants/kaos-ui-stream.service \
               /etc/systemd/system/graphical.target.wants/kaos-ui-stream.service \
               /etc/systemd/system/kaos-ui-stream.service \

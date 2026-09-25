@@ -1,0 +1,22 @@
+[Unit]
+Description=Prepare partitions, APEX fallback, and linkerconfig for Kaos droid-hal-init
+After=local-fs.target systemd-tmpfiles-setup.service
+Before=kaos-droid-hal-init.service
+DefaultDependencies=no
+Conflicts=shutdown.target
+ConditionPathExists=!/etc/kaos-overlay-active
+# Mirrors kaos-droid-hal-init.service's own After=/ConditionPathExists=
+# reasoning -- see that unit. Split out 2026-09-24 to match SailfishOS's
+# droid-hal-prepare.service (Type=oneshot, RemainAfterExit=yes, Before=
+# droid-hal-init.service): this half does mounts/APEX-bootstrap-fallback/
+# linkerconfig-restore/rc-patches/markers and must fully finish before
+# kaos-droid-hal-init.service starts the real droid-hal-init binary.
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh /usr/local/sbin/kaos-droid-hal-prepare.sh
+TimeoutStartSec=120
+
+[Install]
+WantedBy=graphical.target

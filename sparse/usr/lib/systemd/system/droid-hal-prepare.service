@@ -1,8 +1,7 @@
 [Unit]
 Description=Prepare Android partitions and runtime for droid-hal-init
 DefaultDependencies=no
-After=droid-mount-setup.service local-fs.target systemd-udev-settle.service systemd-tmpfiles-setup.service
-Requires=droid-mount-setup.service
+After=local-fs.target systemd-udev-settle.service systemd-tmpfiles-setup.service
 Before=droid-hal-init.service
 
 [Service]

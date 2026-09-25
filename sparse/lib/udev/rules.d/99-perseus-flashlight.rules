@@ -1,0 +1,4 @@
+# Make the flashlight LED brightness sysfs node writable by the input group,
+# so the perseus-aibutton user service (running as defaultuser, which is a
+# member of the input group) can toggle the torch without root privileges.
+SUBSYSTEM=="leds", KERNEL=="flashlight", OWNER="root", GROUP="input", MODE="0660"

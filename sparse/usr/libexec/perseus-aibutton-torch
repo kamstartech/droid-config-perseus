@@ -1,0 +1,17 @@
+#!/bin/sh
+# Perseus AI button default action: toggle flashlight LED.
+# This helper is executed by perseus-aibutton-handler.
+# It requires /sys/class/leds/flashlight/brightness to be writable by
+# the input group (see 99-perseus-flashlight.rules).
+
+B=/sys/class/leds/flashlight/brightness
+MAX_B=/sys/class/leds/flashlight/max_brightness
+
+[ -r "$MAX_B" ] && MAX=$(cat "$MAX_B") || MAX=750
+[ -r "$B" ] && CUR=$(cat "$B") || CUR=0
+
+if [ "${CUR:-0}" -gt 0 ]; then
+    echo 0 > "$B"
+else
+    echo "$MAX" > "$B"
+fi

@@ -1,0 +1,68 @@
+#!/usr/bin/python3
+"""Perseus hall-effect slider handler.
+
+Listens on /dev/input/event2 ("halls") and:
+  - slide-open  (keycode 0x253) -> launch jolla-camera
+  - slide-close (keycode 0x252) -> stop jolla-camera
+
+This is needed because the MCE KEY_CAMERA -> camera-launch path does not
+fire on this port; see docs/references/INSPECTION-BRIEF-camera-slider-aibutton.md
+"""
+
+import os
+import select
+import struct
+import subprocess
+
+EVDEV_PATH = "/dev/input/event2"
+KEY_SLIDE_OPEN = 0x253
+KEY_SLIDE_CLOSE = 0x252
+
+
+def read_event(fd):
+    data = os.read(fd, 24)
+    if len(data) < 24:
+        return None
+    sec, usec, typ, code, val = struct.unpack("llHHi", data)
+    return typ, code, val
+
+
+def launch_camera():
+    # D-Bus StartServiceByName only wakes boosters on this build; use the
+    # same invoker chain as jolla-camera.desktop to actually start the app.
+    subprocess.run(
+        [
+            "/usr/bin/invoker",
+            "-s", "-n", "-d", "5",
+            "--type=silica-media,silica-qt5",
+            "-A", "--",
+            "/usr/bin/jolla-camera",
+        ]
+    )
+
+
+def close_camera():
+    subprocess.run(["killall", "-9", "jolla-camera"])
+
+
+def main():
+    fd = os.open(EVDEV_PATH, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        while True:
+            select.select([fd], [], [])
+            ev = read_event(fd)
+            if ev is None:
+                continue
+            typ, code, val = ev
+            if typ != 1 or val != 1:
+                continue
+            if code == KEY_SLIDE_OPEN:
+                launch_camera()
+            elif code == KEY_SLIDE_CLOSE:
+                close_camera()
+    finally:
+        os.close(fd)
+
+
+if __name__ == "__main__":
+    main()

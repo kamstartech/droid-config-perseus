@@ -1,0 +1,11 @@
+# Perseus AI button default action configuration.
+# Read by perseus-aibutton-handler (user service).
+# A per-user override can be placed at:
+#   ~/.config/perseus-aibutton.conf
+# The override uses the same COMMAND=... syntax.
+# COMMAND is passed to /bin/sh -c on each VOICE_ASSIST (keycode 0x2b1) press.
+
+# Default: toggle the flashlight LED.
+# Requires udev rule 99-perseus-flashlight.rules to grant the input group
+# write access to /sys/class/leds/flashlight/brightness.
+COMMAND="/usr/libexec/perseus-aibutton-torch"

@@ -1,11 +1,12 @@
 [Unit]
-Description=Force RNDIS USB developer mode (gsi.rndis), independent of usb-moded cable detection
+Description=Fallback RNDIS bring-up (cable-gated; defers to usb-moded configfs backend)
 After=usb-moded.service droid-hal-init.service
 Wants=droid-hal-init.service
 
 [Service]
-Type=oneshot
-RemainAfterExit=yes
+# Type=simple: the script waits a 45s grace period for usb-moded before deciding
+# anything; oneshot would stall multi-user.target for that long.
+Type=simple
 ExecStart=/usr/bin/droid/usb-rndis-up.sh
 
 [Install]

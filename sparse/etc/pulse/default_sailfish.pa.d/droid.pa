@@ -1,3 +1,8 @@
-### module-droid-card and module-droid-hidl are loaded by droid-card-delayed.service
-### after /proc/asound/card0/cpe0_state reports ONLINE (ADSP APR ready).
-### Loading them here at PA startup risks Q6ASM zombie sessions on slow boots.
+### module-droid-card and module-droid-hidl are loaded synchronously at PA startup.
+### PulseAudio startup is gated on /proc/asound/card0/cpe0_state == ONLINE via
+### pulseaudio.service.d/50-adsp-wait.conf, so the ADSP APR channel is ready
+### before these modules load. This matches upstream droid-hal-configs and
+### removes the need for the perseus-specific delayed-loading service.
+load-module module-droid-card rate=48000 use_legacy_stream_set_parameters=true
+load-module module-droid-hidl
+set-default-sink sink.primary_output

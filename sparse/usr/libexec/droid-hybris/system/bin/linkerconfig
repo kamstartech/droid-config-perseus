@@ -8,10 +8,19 @@
 # action succeeds without needing the real linkerconfig binary or a fully
 # populated APEX set.
 #
-# Usage: linkerconfig [--target <dir>]
+# When init later loads individual APEX modules (e.g. com.android.media.swcodec),
+# it invokes linkerconfig with --apex <name>. If the real linkerconfig binary is
+# already available in the activated runtime APEX, delegate per-APEX namespace
+# generation to it so binaries such as /apex/com.android.media.swcodec/bin/mediaswcodec
+# get their required [com.android.media.swcodec] section.
+#
+# Usage: linkerconfig [--target <dir>] [--apex <name>] [--strict]
 
 TARGET=/linkerconfig
 PERSIST=/mnt/vendor/persist/ld.config.txt
+REAL=/apex/com.android.runtime/bin/linkerconfig
+APEX_NAME=""
+STRICT=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -23,6 +32,18 @@ while [ $# -gt 0 ]; do
             TARGET="${1#--target=}"
             shift
             ;;
+        --apex)
+            [ -n "$2" ] && APEX_NAME="$2"
+            shift 2
+            ;;
+        --apex=*)
+            APEX_NAME="${1#--apex=}"
+            shift
+            ;;
+        --strict)
+            STRICT=1
+            shift
+            ;;
         *)
             shift
             ;;
@@ -31,12 +52,57 @@ done
 
 mkdir -p "$TARGET" "$TARGET/default" 2>/dev/null || true
 
+# Per-APEX namespace config: delegate to the real linkerconfig when the runtime
+# APEX has been activated. This is the only way to produce the
+# /linkerconfig/<apex>/ld.config.txt files that Android 15 uses for APEX
+# binaries. Fall back to the persisted global config if the real binary is not
+# yet available (e.g. during perform_apex_config --bootstrap).
+if [ -n "$APEX_NAME" ]; then
+    if [ -x "$REAL" ]; then
+        if [ "$STRICT" -eq 1 ]; then
+            if "$REAL" --target "$TARGET" --apex "$APEX_NAME" --strict; then
+                echo "hybris-linkerconfig: delegated --apex $APEX_NAME (strict) to $REAL" > /dev/kmsg 2>/dev/null
+                exit 0
+            fi
+        else
+            if "$REAL" --target "$TARGET" --apex "$APEX_NAME"; then
+                echo "hybris-linkerconfig: delegated --apex $APEX_NAME to $REAL" > /dev/kmsg 2>/dev/null
+                exit 0
+            fi
+        fi
+        echo "hybris-linkerconfig: real linkerconfig failed for $APEX_NAME, using global fallback" > /dev/kmsg 2>/dev/null
+    else
+        echo "hybris-linkerconfig: real linkerconfig not available for $APEX_NAME, using global fallback" > /dev/kmsg 2>/dev/null
+    fi
+fi
+
+# Global config fallback: restore the patched Android-generated config.
 size=0
 [ -f "$PERSIST" ] && size="$(stat -c %s "$PERSIST" 2>/dev/null || echo 0)"
 
 if [ "$size" -ge 100000 ]; then
     cp -f "$PERSIST" "$TARGET/ld.config.txt" 2>/dev/null || true
-    cp -f "$PERSIST" "$TARGET/default/ld.config.txt" 2>/dev/null || true
+    # Kaos (Ubuntu/mainline distros, not this SailfishOS host): route
+    # /usr/bin/* binaries (phoc/phosh -- not an Android path, so they'd
+    # otherwise fall into bionic's narrow "(default)" namespace with no
+    # /vendor/lib64 access at all) into the real [system] namespace, same
+    # idiom as the dir.system = /usr/libexec/droid-hybris/ rule this file
+    # already carries for SailfishOS's own binaries. Harmless no-op here on
+    # the SailfishOS host itself (nothing runs from /usr/bin there).
+    # Confirmed live 2026-09-24: this is the fix for phoc's hwcomposer EGL
+    # renderer failing to dlopen /vendor/lib64/egl/libGLESv2_adreno.so with
+    # "not accessible for the namespace (default)" -- droid-hal-init's own
+    # GenerateLinkerConfiguration() (system/core/init/builtins.cpp) already
+    # calls *this exact wrapper* instead of the real APEX linkerconfig
+    # binary whenever it exists and is executable (see that file's
+    # HYBRIS_BUILD stub-binary check) -- no bind-mount race needed at all,
+    # every earlier attempt to patch /linkerconfig/ld.config.txt via a
+    # mount after the fact was fighting a real binary invocation it could
+    # never actually intercept.
+    if ! grep -q '^dir\.system = /usr/bin/\?$' "$TARGET/ld.config.txt" 2>/dev/null; then
+        sed -i '1i dir.system = /usr/bin/' "$TARGET/ld.config.txt" 2>/dev/null || true
+    fi
+    cp -f "$TARGET/ld.config.txt" "$TARGET/default/ld.config.txt" 2>/dev/null || true
     echo "hybris-linkerconfig: restored $TARGET from persist (${size} bytes)" > /dev/kmsg 2>/dev/null
 else
     echo "hybris-linkerconfig: WARN persist config missing or too small ($size bytes)" > /dev/kmsg 2>/dev/null

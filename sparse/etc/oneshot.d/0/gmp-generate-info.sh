@@ -1,0 +1,1 @@
+/usr/lib/oneshot.d/gmp-generate-info.sh

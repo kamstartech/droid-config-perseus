@@ -67,8 +67,22 @@ Requires: rfkill
 # Bluetooth HIDL bridge for Android 8+ Qualcomm (SDM845)
 Requires: bluebinder
 
-# enable device lock and allow to select untrusted software
-Requires: jolla-devicelock-daemon-encsfa
+# Without FPD: enable device lock and allow to select untrusted software.
+# Mutually exclusive with sailfish-devicelock-fpd below (tama/tucana ports
+# comment this out the same way when the FPD devicelock is in use).
+#Requires: jolla-devicelock-daemon-encsfa
+
+# Fingerprint reader (community edition — talks to Android HAL via libhybris).
+# sailfish-devicelock-fpd and sailfish-fpd-* deps resolve from the official
+# jolla release repo; the three droid/community packages below are built from
+# hybris/mw/sailfish-fpd-community (Android side: make libbiometry_fp_api and
+# make fake_crypt [keymaster 4.0 on perseus], then rpm/copy-hal.sh, then
+# build_packages.sh with droid-biometry-fp.spec, droid-fake-crypt.spec, and
+# the default spec).
+Requires: sailfish-fpd-community
+Requires: sailfish-devicelock-fpd
+Requires: droid-biometry-fp
+Requires: droid-fake-crypt
 
 # Enable home encryption
 #Requires: sailfish-device-encryption
@@ -84,7 +98,9 @@ Requires: geoclue-provider-hybris-binder
 # 1. binder plugin requires Android 8 or a newer base
 # 2. pn54x plugin talks directly to pn54x driver
 # These plugins are mutually exclusive, you need to pick one:
-#Requires: nfcd-binder-plugin
+# perseus runs a stable android.hardware.nfc-service.nxp HAL (verified live,
+# PID 3447, since the TRD-016 SELinux fix) — use the binder plugin, not pn54x.
+Requires: nfcd-binder-plugin
 #Requires: nfcd-pn54x-plugin
 
 %description -n patterns-sailfish-device-adaptation-perseus

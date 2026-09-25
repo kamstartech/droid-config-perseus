@@ -20,6 +20,54 @@ find_dm_dev() {
 
 ensure_mp() { [ -d "$1" ] || mkdir -p "$1"; }
 
+# Mount real Android userdata partition on /data.
+# Perseus historically used a 64 MB tmpfs /data because Android /data/data is
+# FBE-encrypted and unreadable in SailfishOS. However, APEX decompression
+# (apexd) writes to /data/apex/decompressed/ and needs a real filesystem with
+# enough free space. Mounting the userdata partition here gives apexd that
+# target while the encrypted /data/data/ sub-tree remains inaccessible.
+mount_real_data() {
+    mountpoint -q /data 2>/dev/null && return 0
+    ensure_mp /data
+    # The Sailfish rootfs is a bind-mount of a directory on the userdata
+    # partition; /proc/mounts shows the underlying ext4 device mounted at /.
+    local data_dev
+    data_dev=$(awk '$2 == "/" && $3 == "ext4" {print $1; exit}' /proc/mounts)
+    if [ -z "$data_dev" ]; then
+        log "WARN: cannot determine userdata device from /proc/mounts"
+        return 1
+    fi
+    log "Mounting real userdata partition $data_dev on /data"
+    if mount -t ext4 -o rw,noatime "$data_dev" /data; then
+        log "Real userdata mounted on /data"
+        # Restore Android /data ownership/permissions.
+        chown system:system /data
+        chmod 0771 /data
+        return 0
+    else
+        log "WARN: failed to mount real userdata on /data"
+        return 1
+    fi
+}
+
+# Android init.rc marks /data/apex/decompressed as FBE-encrypted
+# (encryption=Require). SailfishOS has no FBE key, so apexd fails with
+# "Required key not available" when it tries to write decompressed APEXes
+# there. Bind-mount an unencrypted sibling directory over it so apexd can
+# write to a real filesystem.
+ensure_apex_decompression_unencrypted() {
+    [ -d /data/apex/decompressed ] || return 0
+    ensure_mp /data/.apex-decompressed
+    chown root:system /data/.apex-decompressed
+    chmod 0755 /data/.apex-decompressed
+    if mountpoint -q /data/apex/decompressed 2>/dev/null; then
+        umount /data/apex/decompressed 2>/dev/null || true
+    fi
+    mount --bind /data/.apex-decompressed /data/apex/decompressed && \
+        log "Bind-mounted unencrypted /data/.apex-decompressed over /data/apex/decompressed" || \
+        log "WARN: failed to bind-mount unencrypted APEX decompression dir"
+}
+
 # Mount system_root from dm device (dm-verity) or raw block device
 if ! mountpoint -q /system_root 2>/dev/null; then
     ensure_mp /system_root
@@ -122,13 +170,40 @@ for d in /sys/block/dm-*; do
     [ -e "/dev/block/mapper/$name" ] || ln -sf "$dev" "/dev/block/mapper/$name"
 done
 
+# Mount the real Android userdata partition on /data before droid-hal-init
+# starts. This gives apexd a real filesystem to decompress compressed APEXes
+# into, instead of the 64 MB tmpfs that droid-hal-startup.sh would otherwise
+# create.
+mount_real_data
+ensure_apex_decompression_unencrypted
+
+# /data/misc is FBE-encrypted in SailfishOS, so init.rc post-fs-data actions that
+# create /data/misc/camera and /data/misc/cameraserver fail with
+# "Required key not available". CameraService and the camera HAL need these
+# directories. Mount a writable overlay on /data/misc before droid-hal-init
+# parses vendor RC files and starts the camera provider.
+ensure_misc_overlay() {
+    [ -d /data/misc ] || return 0
+    if mountpoint -q /data/misc 2>/dev/null; then
+        log "/data/misc overlay already mounted"
+        return 0
+    fi
+    mkdir -p /tmp/misc-upper /tmp/misc-work
+    mount -t overlay overlay \
+        -o lowerdir=/data/misc,upperdir=/tmp/misc-upper,workdir=/tmp/misc-work \
+        /data/misc && \
+        log "Mounted overlay on /data/misc (FBE workaround)" || \
+        log "WARN: failed to mount /data/misc overlay"
+}
+ensure_misc_overlay
+
 # Android 15 APEX resolution: bionic libs and linker live in
 # /apex/com.android.runtime/ which is mounted by apexd. Use a tmpfs on /apex
 # so apexd can bind-mount the activated APEX modules here.
 if ! mountpoint -q /apex 2>/dev/null; then
     log "Mounting tmpfs on /apex for Android 15 APEX"
     mkdir -p /apex
-    mount -t tmpfs -o mode=0755,size=64m tmpfs /apex
+    mount -t tmpfs -o mode=0755,size=128m tmpfs /apex
 fi
 
 # Populate a bootstrap APEX fallback in the service namespace. Android tools
@@ -200,6 +275,30 @@ if [ ! -f /apex/com.android.runtime/lib64/bionic/libc.so ]; then
 
     log "APEX fallback populated: $(ls /apex/com.android.runtime/lib64/bionic/ 2>/dev/null | wc -w) lib64, $(ls /apex/com.android.runtime/bin/ 2>/dev/null | wc -w) bin"
 fi
+
+# Pre-build a patched mediaswcodec.32rc with stdio_to_kmsg.  droid-hal-startup.sh
+# will race apexd to bind-mount this over the real APEX file before droid-hal-init
+# parses it; pre-building here keeps the critical path inside the race loop down
+# to poll + mount --bind only.
+prebuild_mediaswcodec_kmsg_rc() {
+    local dir=/run/hybris-mediaswcodec-etc
+    local out="$dir/mediaswcodec.32rc"
+    mkdir -p "$dir"
+    cat > "$out" <<'EOF'
+##  for SDK releases >= 32
+##
+service media.swcodec /apex/com.android.media.swcodec/bin/mediaswcodec
+    class main
+    user mediacodec
+    group camera drmrpc mediadrm
+    ioprio rt 4
+    task_profiles ProcessCapacityHigh
+    stdio_to_kmsg
+EOF
+    chmod 0644 "$out"
+    log "Pre-built patched mediaswcodec.32rc at $out"
+}
+prebuild_mediaswcodec_kmsg_rc
 
 # Linkerconfig: use the full Android-generated config saved from a previous
 # Android boot. That config properly isolates vendor/system namespaces and
