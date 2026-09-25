@@ -96,7 +96,6 @@ adapt_boot() {
     : "${DEV_DRM_RENDER_MAJOR:=226}"
     : "${DEV_DRM_RENDER_MINOR:=128}"
     : "${DEV_DISPLAY_SIZE:=1080x2340}"
-    : "${DEV_MESA_KGSL:=/usr/local/mesa-kgsl}"
 
     # Only systemd distros are adapted; anything else boots via its own init
     # (or the kaos-init fallback) and is left alone.
