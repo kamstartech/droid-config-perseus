@@ -114,6 +114,42 @@ adapt_boot() {
         log "boot: wrote /etc/selinux/config (disabled)"
     fi
 
+    # Persistent kmsg capture + verbose early systemd logging. Confirmed
+    # live 2026-09-26: a failed Kali cold boot got all the way through this
+    # whole script (dm-refresh and adaptation both completed cleanly) but
+    # left ZERO trace anywhere that survives the automatic fallback-to-
+    # Android reboot that follows a failed boot -- the journal never got
+    # past an empty directory (systemd/PID1 crashed or looped before its
+    # first disk flush), and dmesg's ring buffer is gone the moment
+    # Android's own kernel log takes over post-fallback. Neither problem
+    # touches a file on THIS rootfs's own /var/log, though -- that's on
+    # /data, and survives a failed boot exactly the way kaos-coldboot.log
+    # (written by log(), above) already does. Start a background kmsg
+    # reader now, before handing off to the real init, so whatever
+    # systemd/PID1 emits from this point forward -- including a kernel
+    # panic message, were one to happen -- lands in a file readable
+    # afterward via adb. setsid detaches it from this script's own
+    # session; neither this script exiting nor trampoline's later
+    # execv(init) kills an already-running child, so it keeps tailing
+    # /dev/kmsg straight through the systemd handoff.
+    if [ -e /dev/kmsg ]; then
+        : > /var/log/kaos-boot-kmsg.log
+        setsid sh -c 'exec cat /dev/kmsg >> /var/log/kaos-boot-kmsg.log 2>&1' &
+        log "boot: started persistent kmsg logger (pid $!)"
+    fi
+
+    # Make systemd itself as verbose as possible and point it at kmsg
+    # (which the logger above is now capturing) rather than relying on
+    # journald's own on-disk write path -- the thing that just failed to
+    # produce anything at all on the boot this is responding to.
+    mkdir -p /etc/systemd/system.conf.d
+    {
+        echo '[Manager]'
+        echo 'LogLevel=debug'
+        echo 'LogTarget=kmsg'
+    } > /etc/systemd/system.conf.d/90-kaos-debug-logging.conf
+    log "boot: wrote verbose systemd logging config (debug, kmsg target)"
+
     # SailfishOS is self-managed (lipstick compositor + native .mount units).
     if [ -e /usr/bin/lipstick ] || grep -qs '^ID=sailfishos' /etc/os-release 2>/dev/null; then
         log "boot: self-managed distro -- no adaptation"
