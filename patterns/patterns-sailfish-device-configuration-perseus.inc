@@ -48,7 +48,17 @@ Requires: geoclue-provider-mlsdb
 # that kept reappearing in generated kickstarts no matter how many times the
 # top-level .ks was hand-patched, since ssuks regenerates it fresh from this
 # feature on every droid-config-perseus rebuild.
-Requires: harbour-containers
+#
+# Disabled 2026-09-26: harbour-containers itself Requires: qxcompositor
+# >= 0.0.6 (github.com/sailfish-containers/qxcompositor), which fails to
+# build against this SDK's current QtCompositor -- its QmlCompositor
+# class was written against an older API where QWaylandQuickCompositor
+# itself managed a window (3-arg ctor taking a QQuickView*, exposing
+# window()); the current header only takes (socketName, extensions) and
+# has no window() at all. Real porting work, not a one-line fix -- left
+# disabled here rather than block the whole image build on it. Re-enable
+# once qxcompositor is ported (or forked/patched) against the current API.
+#Requires: harbour-containers
 
 %description -n patterns-sailfish-device-configuration-perseus
 Pattern with packages for perseus configurations
