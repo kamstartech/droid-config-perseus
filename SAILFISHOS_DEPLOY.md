@@ -3,8 +3,8 @@
 ## Build Output
 
 After successful `mic` build:
-- **Raw rootfs**: `SailfishOScommunity-release-5.0.0.76-perseus/sfe-perseus-5.0.0.76.tar.bz2`
-- **Flashable zip**: `SailfishOScommunity-release-5.0.0.76-perseus/sailfishos-perseus-release-5.0.0.76.zip`
+- **Raw rootfs**: `SailfishOScommunity-release-5.1.0.11-perseus/sfe-perseus-5.1.0.11.tar.bz2`
+- **Flashable zip**: `SailfishOScommunity-release-5.1.0.11-perseus/sailfishos-perseus-release-5.1.0.11.zip`
 
 ## Deploy to Device (ADB + SSH Method)
 
@@ -27,14 +27,14 @@ adb wait-for-device
 
 # 2. Push the new rootfs archive to device
 adb push \
-  /home/jimmy/hadk/SailfishOScommunity-release-5.0.0.76-perseus/sfe-perseus-5.0.0.76.tar.bz2 \
-  /data/local/tmp/sfe-perseus-5.0.0.76.tar.bz2
+  /home/jimmy/hadk/SailfishOScommunity-release-5.1.0.11-perseus/sfe-perseus-5.1.0.11.tar.bz2 \
+  /data/local/tmp/sfe-perseus-5.1.0.11.tar.bz2
 
 # 3. Remove old rootfs (preserve if you want rollback)
 adb shell "rm -rf /data/.stowaway/sailfish && mkdir -p /data/.stowaway/sailfish"
 
 # 4. Extract new rootfs
-adb shell "tar -xjf /data/local/tmp/sfe-perseus-5.0.0.76.tar.bz2 -C /data/.stowaway/sailfish/"
+adb shell "tar -xjf /data/local/tmp/sfe-perseus-5.1.0.11.tar.bz2 -C /data/.stowaway/sailfish/"
 
 # 5. Enable persistent journald logs (HADK: Logs across reboots)
 adb shell "sed -i 's/^Storage=volatile/Storage=automatic/' /data/.stowaway/sailfish/etc/systemd/journald.conf"
@@ -75,7 +75,7 @@ adb shell "ls /data/.stowaway/sailfish/sbin/init"
 #    adb shell "ls /data/.stowaway/sailfish/usr/lib64/dri/msm_dri.so"
 
 # 8. Clean up temp archive
-adb shell "rm -f /data/local/tmp/sfe-perseus-5.0.0.76.tar.bz2"
+adb shell "rm -f /data/local/tmp/sfe-perseus-5.1.0.11.tar.bz2"
 
 # 9. Trigger SailfishOS boot — COLD BOOT (power off, then power on).
 #    This is the kaos-way path: Android first-stage init → trampoline
@@ -197,5 +197,5 @@ If the new rootfs fails, restore from backup:
 ```bash
 adb root
 adb shell "rm -rf /data/.stowaway/sailfish/*"
-adb shell "tar -xjf /data/local/tmp/sfe-perseus-BACKUP.tar.bz2 -C /data/.stowaway/sailfish/"
+adb shell "tar -xjf /data/local/tmp/sfe-perseus-5.1.0.11-BACKUP.tar.bz2 -C /data/.stowaway/sailfish/"
 ```
